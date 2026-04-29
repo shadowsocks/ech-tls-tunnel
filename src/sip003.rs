@@ -111,6 +111,10 @@ impl PluginOptions {
     /// - each option is `key=value` or just `key` (value defaults to `""`)
     /// - backslash escapes `\;`, `\=`, and `\\` allow those literals
     ///   inside keys or values
+    /// - within a single option, only the *first* unescaped `=` is the
+    ///   key/value separator; any subsequent `=` characters are part of
+    ///   the value verbatim. This matters for values that legitimately
+    ///   contain `=` (e.g. base64 padding in `ech_config=AAAA==`).
     pub fn parse(s: &str) -> Result<Self> {
         let mut map = HashMap::new();
 
@@ -118,18 +122,12 @@ impl PluginOptions {
             if raw.is_empty() {
                 continue;
             }
-            let pieces = split_unescaped(&raw, '=');
-            let mut it = pieces.into_iter();
-            let key = unescape(it.next().unwrap_or_default());
-            let value = it.next().map(unescape).unwrap_or_default();
-            if it.next().is_some() {
-                return Err(anyhow!(
-                    "plugin option {key:?} has more than one unescaped `=`"
-                ));
-            }
+            let (raw_key, raw_value) = split_first_unescaped(&raw, '=');
+            let key = unescape(raw_key);
             if key.is_empty() {
                 return Err(anyhow!("empty key in plugin options: {s:?}"));
             }
+            let value = raw_value.map(unescape).unwrap_or_default();
             map.insert(key, value);
         }
 
@@ -181,6 +179,28 @@ fn split_unescaped(s: &str, delim: char) -> Vec<String> {
     }
     out.push(current);
     out
+}
+
+/// Split `s` at the FIRST unescaped occurrence of `delim`. Returns
+/// `(before, Some(after))` if a delimiter was found, otherwise
+/// `(s_clone, None)`.
+fn split_first_unescaped(s: &str, delim: char) -> (String, Option<String>) {
+    let mut before = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            before.push(c);
+            if let Some(next) = chars.next() {
+                before.push(next);
+            }
+        } else if c == delim {
+            let after: String = chars.collect();
+            return (before, Some(after));
+        } else {
+            before.push(c);
+        }
+    }
+    (before, None)
 }
 
 /// Resolve `\;`, `\=`, `\\` (and `\<other>` → `<other>`) in `s`.
@@ -307,9 +327,18 @@ mod tests {
     }
 
     #[test]
-    fn plugin_options_extra_unescaped_equals_errors() {
-        let err = PluginOptions::parse("k=a=b").unwrap_err();
-        assert!(format!("{err:#}").contains("more than one unescaped"));
+    fn plugin_options_only_first_equals_splits() {
+        // Subsequent `=` chars are part of the value verbatim. This is
+        // what lets us pass a base64 ECHConfigList (which often ends in
+        // `==`) without escaping.
+        let opts = PluginOptions::parse("k=a=b").unwrap();
+        assert_eq!(opts.get("k"), Some("a=b"));
+    }
+
+    #[test]
+    fn plugin_options_base64_value_with_padding() {
+        let opts = PluginOptions::parse("ech_config=AEf+DQA9AA==").unwrap();
+        assert_eq!(opts.get("ech_config"), Some("AEf+DQA9AA=="));
     }
 
     #[test]

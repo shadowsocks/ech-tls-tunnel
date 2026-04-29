@@ -222,3 +222,124 @@ async fn sip003_full_pipeline_with_shadowsocks_rust_inner() {
         "unexpected response body: stdout={stdout:?} stderr={stderr:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sip003_full_pipeline_with_ech() {
+    tokio::time::timeout(TEST_TIMEOUT, sip003_full_pipeline_with_ech_inner())
+        .await
+        .expect("sip003_e2e ECH timed out after 10 minutes");
+}
+
+async fn sip003_full_pipeline_with_ech_inner() {
+    if let Some(reason) = precondition() {
+        eprintln!("SKIP sip003_e2e ECH: {reason}");
+        return;
+    }
+
+    use ech_tls_tunnel::ech::{encode_config_list_b64, EchServerKey};
+    let plugin_path: PathBuf = env!("CARGO_BIN_EXE_ech-tls-tunnel").into();
+
+    // Self-signed cert covering both the inner and outer SNI: the
+    // server presents a cert valid for `public_name` to plain probes
+    // and a cert valid for `tunnel.local` only after ECH decryption.
+    // For this test we use a single SAN list — handshake succeeds
+    // either way because the test client trusts our cert directly.
+    let kp = rcgen::generate_simple_self_signed(vec!["tunnel.local".into(), "front.local".into()])
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, kp.cert.pem()).unwrap();
+    std::fs::write(&key_path, kp.key_pair.serialize_pem()).unwrap();
+
+    // ECH HPKE keypair
+    let ech_key = EchServerKey::generate("front.local").unwrap();
+    let ech_key_path = dir.path().join("ech.key");
+    ech_key.write_to(&ech_key_path).unwrap();
+    let ech_b64 = encode_config_list_b64(&ech_key.marshal_config_list().unwrap());
+
+    let echo_addr = spawn_echo_server().await;
+    let tunnel_port = pick_port();
+    let local_port = pick_port();
+
+    let ssserver_opts = format!(
+        "mode=server;domain=tunnel.local;path=/ws-ech;cert={};key={};ech_public_name=front.local;ech_key={}",
+        cert_path.display(),
+        key_path.display(),
+        ech_key_path.display()
+    );
+    let _ssserver = ChildGuard(Some(
+        Command::new("ssserver")
+            .args([
+                "-s",
+                &format!("127.0.0.1:{tunnel_port}"),
+                "-k",
+                "ech-testpass",
+                "-m",
+                "aes-128-gcm",
+                "--plugin",
+                plugin_path.to_str().unwrap(),
+                "--plugin-opts",
+                &ssserver_opts,
+            ])
+            .spawn()
+            .expect("spawn ssserver"),
+    ));
+    wait_for_ready(&format!("127.0.0.1:{tunnel_port}")).await;
+
+    let sslocal_opts = format!(
+        "mode=client;sni=tunnel.local;path=/ws-ech;ca_file={};ech_config={ech_b64}",
+        cert_path.display()
+    );
+    let _sslocal = ChildGuard(Some(
+        Command::new("sslocal")
+            .args([
+                "-b",
+                &format!("127.0.0.1:{local_port}"),
+                "-s",
+                &format!("127.0.0.1:{tunnel_port}"),
+                "-k",
+                "ech-testpass",
+                "-m",
+                "aes-128-gcm",
+                "--protocol",
+                "socks",
+                "--plugin",
+                plugin_path.to_str().unwrap(),
+                "--plugin-opts",
+                &sslocal_opts,
+            ])
+            .spawn()
+            .expect("spawn sslocal"),
+    ));
+    wait_for_ready(&format!("127.0.0.1:{local_port}")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let url = format!("http://{}/ech-hello", echo_addr);
+    let out = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "15",
+            "--socks5-hostname",
+            &format!("127.0.0.1:{local_port}"),
+            &url,
+        ])
+        .output()
+        .expect("run curl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "curl failed: status={:?}\nstdout: {}\nstderr: {}",
+        out.status,
+        stdout,
+        stderr
+    );
+    assert_eq!(
+        stdout.trim(),
+        "echo:/ech-hello",
+        "unexpected ECH response body: stdout={stdout:?} stderr={stderr:?}"
+    );
+}

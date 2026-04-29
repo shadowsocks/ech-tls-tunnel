@@ -9,8 +9,12 @@ repository = "https://github.com/shadowsocks/ech-tls-tunnel"
 [dependencies]
 anyhow = "1"
 arc-swap = "1"
+base64 = "0.22"
 boring = "4"
+boring-sys = "4"
 bytes = "1"
+clap = { version = "4", features = ["derive"] }
+foreign-types-shared = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 http = "1"
 http-body-util = "0.1"
@@ -19,6 +23,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 instant-acme = "0.7"
 libc = "0.2"
 pin-project-lite = "0.2"
+rand = "0.8"
 rcgen = "0.13"
 sha2 = "0.10"
 socket2 = { version = "0.5", features = ["all"] }

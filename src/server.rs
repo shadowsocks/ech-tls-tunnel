@@ -167,7 +167,8 @@ async fn build_tls_server(cfg: &ServerCfg, challenges: Arc<ChallengeStore>) -> R
                     .await?
                 }
             };
-            let server = TlsServer::build_from_pem_with(&cert.cert_pem, &cert.key_pem, challenges)?;
+            let server =
+                TlsServer::build_from_pem_with(cfg, &cert.cert_pem, &cert.key_pem, challenges)?;
             Ok(server)
         }
     }
