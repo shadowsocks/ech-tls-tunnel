@@ -18,7 +18,9 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
 
-use crate::config::ServerCfg;
+use crate::acme;
+use crate::challenge::ChallengeStore;
+use crate::config::{ServerCfg, ServerTls};
 use crate::net;
 use crate::stealth;
 use crate::tls_server::TlsServer;
@@ -29,7 +31,8 @@ use crate::ws::WsByteStream;
 /// `upstream_addr` is the loopback `ssserver` listener
 /// (`SS_LOCAL_HOST:SS_LOCAL_PORT`).
 pub async fn run(listen_addr: &str, upstream_addr: &str, cfg: ServerCfg) -> Result<()> {
-    let tls = Arc::new(TlsServer::build_static(&cfg)?);
+    let challenges = Arc::new(ChallengeStore::new());
+    let tls = Arc::new(build_tls_server(&cfg, challenges.clone()).await?);
     let listener = net::create_listener(listen_addr, cfg.fast_open).await?;
     let cfg = Arc::new(cfg);
     let upstream = Arc::<str>::from(upstream_addr);
@@ -127,6 +130,47 @@ async fn handle_request(
         .header(header::SEC_WEBSOCKET_ACCEPT, accept_value)
         .body(Full::new(Bytes::new()))
         .expect("static 101 response is valid"))
+}
+
+/// Build a [`TlsServer`] from the config, dispatching on
+/// [`ServerTls::Static`] vs [`ServerTls::Acme`]. The ACME path may
+/// block on a network roundtrip to issue/refresh the cert.
+async fn build_tls_server(cfg: &ServerCfg, challenges: Arc<ChallengeStore>) -> Result<TlsServer> {
+    match &cfg.tls {
+        ServerTls::Static { .. } => TlsServer::build_static_with(cfg, challenges),
+        ServerTls::Acme {
+            email,
+            staging,
+            cache_dir,
+        } => {
+            let mut domains: Vec<&str> = vec![cfg.domain.as_str()];
+            if let Some(ech) = &cfg.ech {
+                if !ech.public_name.is_empty() && ech.public_name != cfg.domain {
+                    domains.push(ech.public_name.as_str());
+                }
+            }
+            let cert = match acme::load_cached(cache_dir) {
+                Some(c) => {
+                    tracing::info!("using cached cert from {}", cache_dir.display());
+                    c
+                }
+                None => {
+                    tracing::info!("issuing new cert via ACME (TLS-ALPN-01) for {domains:?}");
+                    acme::issue(
+                        &domains,
+                        email,
+                        *staging,
+                        cache_dir,
+                        None,
+                        challenges.clone(),
+                    )
+                    .await?
+                }
+            };
+            let server = TlsServer::build_from_pem_with(&cert.cert_pem, &cert.key_pem, challenges)?;
+            Ok(server)
+        }
+    }
 }
 
 fn is_ws_upgrade(req: &Request<Incoming>) -> bool {

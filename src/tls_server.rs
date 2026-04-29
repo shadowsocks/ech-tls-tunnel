@@ -1,19 +1,21 @@
-//! BoringSSL-backed TLS server for the static-cert deployment path.
+//! BoringSSL-backed TLS server.
 //!
-//! For v0.1 this loads a PEM cert + key from the paths in
-//! [`ServerTls::Static`] and exposes a hot-swappable [`TlsServer`] handle
-//! so the upcoming ACME renewal task (v0.2) can replace the cert without
-//! dropping in-flight connections.
+//! Loads the production cert/key (from disk for `ServerTls::Static`,
+//! from ACME for `ServerTls::Acme`), wraps the resulting `SslAcceptor`
+//! in `ArcSwap` so the renewal task can hot-swap on cert refresh, and
+//! installs an ALPN-select callback that lets TLS-ALPN-01 challenges
+//! share the same listener as production traffic.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
-use boring::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use boring::ssl::{AlpnError, NameType, SslAcceptor, SslContextBuilder, SslFiletype, SslMethod};
 use tokio::net::TcpStream;
 use tokio_boring::SslStream;
 
+use crate::challenge::ChallengeStore;
 use crate::config::{ServerCfg, ServerTls};
 
 /// Live TLS acceptor backed by BoringSSL. The inner [`SslAcceptor`] sits
@@ -29,9 +31,15 @@ impl std::fmt::Debug for TlsServer {
 }
 
 impl TlsServer {
-    /// Build from a [`ServerCfg`] whose `tls` is [`ServerTls::Static`].
-    /// (Acme support arrives in v0.2.)
+    /// Build with a default empty `ChallengeStore`. Convenient for
+    /// callers that won't ever serve TLS-ALPN-01.
     pub fn build_static(cfg: &ServerCfg) -> Result<Self> {
+        Self::build_static_with(cfg, Arc::new(ChallengeStore::new()))
+    }
+
+    /// Build from `ServerTls::Static`, with an explicit `ChallengeStore`
+    /// shared with the ACME flow.
+    pub fn build_static_with(cfg: &ServerCfg, challenges: Arc<ChallengeStore>) -> Result<Self> {
         let (cert_file, key_file) = match &cfg.tls {
             ServerTls::Static {
                 cert_file,
@@ -39,11 +47,25 @@ impl TlsServer {
             } => (cert_file, key_file),
             ServerTls::Acme { .. } => {
                 return Err(anyhow!(
-                    "build_static called with tls=acme; use the v0.2 ACME path"
+                    "build_static called with tls=acme; use the ACME path"
                 ))
             }
         };
-        let acceptor = build_acceptor_from_pem(cert_file, key_file)?;
+        let acceptor = build_acceptor_from_pem(cert_file, key_file, challenges)?;
+        Ok(Self {
+            acceptor: Arc::new(ArcSwap::from_pointee(acceptor)),
+        })
+    }
+
+    /// Build from cert/key already in memory (PEM strings) plus a
+    /// `ChallengeStore`. Used by the ACME path which has just received
+    /// a freshly-issued cert.
+    pub fn build_from_pem_with(
+        cert_pem: &str,
+        key_pem: &str,
+        challenges: Arc<ChallengeStore>,
+    ) -> Result<Self> {
+        let acceptor = build_acceptor_from_pem_strs(cert_pem, key_pem, challenges)?;
         Ok(Self {
             acceptor: Arc::new(ArcSwap::from_pointee(acceptor)),
         })
@@ -63,7 +85,11 @@ impl TlsServer {
     }
 }
 
-fn build_acceptor_from_pem(cert: &Path, key: &Path) -> Result<SslAcceptor> {
+fn build_acceptor_from_pem(
+    cert: &Path,
+    key: &Path,
+    challenges: Arc<ChallengeStore>,
+) -> Result<SslAcceptor> {
     let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .context("init SslAcceptorBuilder")?;
     b.set_certificate_chain_file(cert)
@@ -71,9 +97,107 @@ fn build_acceptor_from_pem(cert: &Path, key: &Path) -> Result<SslAcceptor> {
     b.set_private_key_file(key, SslFiletype::PEM)
         .with_context(|| format!("load key {}", key.display()))?;
     b.check_private_key().context("cert/key pair check")?;
-    b.set_alpn_protos(&alpn_wire(&[b"h2", b"http/1.1"]))
-        .context("set ALPN")?;
+    install_alpn_callback(&mut b, challenges)?;
     Ok(b.build())
+}
+
+fn build_acceptor_from_pem_strs(
+    cert_pem: &str,
+    key_pem: &str,
+    challenges: Arc<ChallengeStore>,
+) -> Result<SslAcceptor> {
+    use boring::pkey::PKey;
+    use boring::x509::X509;
+
+    let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
+        .context("init SslAcceptorBuilder")?;
+    let mut x509s = X509::stack_from_pem(cert_pem.as_bytes()).context("parse cert chain pem")?;
+    let mut iter = x509s.drain(..);
+    let leaf = iter.next().ok_or_else(|| anyhow!("empty cert chain"))?;
+    b.set_certificate(&leaf).context("set leaf cert")?;
+    for ca in iter {
+        b.add_extra_chain_cert(ca).context("add chain cert")?;
+    }
+    let pkey = PKey::private_key_from_pem(key_pem.as_bytes()).context("parse private key pem")?;
+    b.set_private_key(&pkey).context("set private key")?;
+    b.check_private_key().context("cert/key pair check")?;
+    install_alpn_callback(&mut b, challenges)?;
+    Ok(b.build())
+}
+
+/// Install the ALPN-select callback that:
+///   1. If the client offers `acme-tls/1` AND we have a matching
+///      challenge installed for the SNI, swap the SSL context to the
+///      challenge cert and negotiate `acme-tls/1`.
+///   2. Otherwise, pick the first match from `["h2", "http/1.1"]`.
+fn install_alpn_callback(b: &mut SslContextBuilder, challenges: Arc<ChallengeStore>) -> Result<()> {
+    b.set_alpn_protos(&alpn_wire(&[b"h2", b"http/1.1"]))
+        .context("set ALPN protos")?;
+    b.set_alpn_select_callback(move |ssl, client_protos| {
+        let mut iter = AlpnIter::new(client_protos);
+        let mut offered_acme = false;
+        let mut first_h2: Option<&[u8]> = None;
+        let mut first_h11: Option<&[u8]> = None;
+        for proto in iter.by_ref() {
+            if proto == b"acme-tls/1" {
+                offered_acme = true;
+            } else if proto == b"h2" && first_h2.is_none() {
+                first_h2 = Some(proto);
+            } else if proto == b"http/1.1" && first_h11.is_none() {
+                first_h11 = Some(proto);
+            }
+        }
+
+        if offered_acme {
+            let sni = ssl.servername(NameType::HOST_NAME).map(str::to_string);
+            if let Some(sni) = sni {
+                if let Some(ctx) = challenges.get(&sni) {
+                    if ssl.set_ssl_context(&ctx).is_ok() {
+                        // `b"acme-tls/1"` is &'static, valid for any 'a.
+                        return Ok(b"acme-tls/1");
+                    }
+                }
+            }
+            return Err(AlpnError::ALERT_FATAL);
+        }
+
+        if let Some(p) = first_h2 {
+            return Ok(p);
+        }
+        if let Some(p) = first_h11 {
+            return Ok(p);
+        }
+        Err(AlpnError::NOACK)
+    });
+    Ok(())
+}
+
+/// Iterator over ALPN protocol entries in the wire format
+/// (length-prefixed, concatenated).
+struct AlpnIter<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> AlpnIter<'a> {
+    fn new(s: &'a [u8]) -> Self {
+        Self { remaining: s }
+    }
+}
+
+impl<'a> Iterator for AlpnIter<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.remaining.is_empty() {
+            return None;
+        }
+        let len = self.remaining[0] as usize;
+        if len == 0 || self.remaining.len() < 1 + len {
+            return None;
+        }
+        let proto = &self.remaining[1..1 + len];
+        self.remaining = &self.remaining[1 + len..];
+        Some(proto)
+    }
 }
 
 /// Encode an ALPN protocol list as length-prefixed concatenation:
@@ -194,7 +318,12 @@ mod tests {
             TlsServer::build_static(&server_cfg(cert_path.clone(), key_path.clone())).unwrap();
 
         // Build a second acceptor and swap it in.
-        let new_acceptor = build_acceptor_from_pem(&cert_path, &key_path).unwrap();
+        let new_acceptor = build_acceptor_from_pem(
+            &cert_path,
+            &key_path,
+            Arc::new(crate::challenge::ChallengeStore::new()),
+        )
+        .unwrap();
         server.swap(new_acceptor);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
