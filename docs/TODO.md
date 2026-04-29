@@ -60,6 +60,19 @@ Each item maps to a small, mergeable PR.
       shadowsocks-rust ssserver/sslocal (`sip003_full_pipeline_with_ech`)
 - [ ] VPS smoke + Wireshark capture review (manual, follow-up)
 
+## Post-v0.4 — Client browser fingerprint ✅
+
+- [x] `src/fingerprint.rs` — `FingerprintParams` + 6 profile constants
+      (Chrome, Firefox, Safari, iOS, Android, Edge) + `random` weighted
+- [x] `fingerprint=` plugin option on the client side
+- [x] Applied via boring's `set_cipher_list` / `set_curves_list` /
+      `set_grease_enabled` / `set_permute_extensions` /
+      `set_sigalgs_list`
+- [x] Profiles ported from `metacubex/utls` `u_parrots.go` (via
+      mihomo-rust's port)
+- [x] e2e test runs the non-ECH path with `fingerprint=chrome`
+      through real `sslocal`
+
 ## v0.4 — Polish ✅
 
 - [x] README rewrite with deployment recipe
