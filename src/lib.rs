@@ -4,6 +4,8 @@
 //! See `docs/PRD.md` for the high-level design and `docs/ROADMAP.md` for
 //! the milestone breakdown.
 
+pub mod acme;
+pub mod challenge;
 pub mod client;
 pub mod config;
 pub mod net;

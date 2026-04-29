@@ -16,8 +16,11 @@ http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+instant-acme = "0.7"
 libc = "0.2"
 pin-project-lite = "0.2"
+rcgen = "0.13"
+sha2 = "0.10"
 socket2 = { version = "0.5", features = ["all"] }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "time"] }
 tokio-boring = "4"
