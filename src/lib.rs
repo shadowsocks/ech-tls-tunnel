@@ -4,6 +4,7 @@
 //! See `docs/PRD.md` for the high-level design and `docs/ROADMAP.md` for
 //! the milestone breakdown.
 
+pub mod config;
 pub mod net;
 pub mod sip003;
 pub mod stealth;

@@ -12,9 +12,11 @@ Each item maps to a small, mergeable PR. Strikethrough as completed.
       that asserts `fake_404()` returns 404 + `Server` header.
 - [ ] `src/sip003.rs` — `SipEnv::from_env()` and option parser; unit
       test with a synthetic env.
-- [ ] `src/config.rs` — `Config`, `ServerCfg`, `ClientCfg`, `ServerTls`
-      enum (`Acme | Static`), `ClientTrust` enum. Round-trip tests for
-      the two example YAMLs.
+- [x] `src/sip003.rs` — `SipEnv::from_env()` and `PluginOptions` parser
+      (escape-aware), with `mode=server|client` helper.
+- [x] `src/config.rs` — `Config::from_options(&PluginOptions)` builds
+      `ServerCfg` / `ClientCfg` directly from `SS_PLUGIN_OPTIONS`. No
+      YAML, no separate config file. Covered by 17 unit tests.
 - [ ] `src/tls_server.rs` — BoringSSL `SslAcceptor` from static
       `cert_file` + `key_file`. ALPN h2 + http/1.1. Wrapped in
       `ArcSwap` for future hot-reload.

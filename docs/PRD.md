@@ -34,6 +34,10 @@ ClientHello.
   fake nginx 404, indistinguishable from a stock nginx default.
 - **G6**: Localhost end-to-end test using real `shadowsocks-rust`,
   self-signed cert, and `curl`. Reproducible without VPS access.
+- **G7**: No separate config file. The plugin reads everything it needs
+  from `SS_PLUGIN_OPTIONS`. This keeps deployment to one shadowsocks
+  config edit and removes a class of "where does the config live"
+  questions.
 
 ## Non-goals (v1)
 
