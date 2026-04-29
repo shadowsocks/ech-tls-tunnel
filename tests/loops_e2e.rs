@@ -109,6 +109,7 @@ async fn full_loop_round_trips_payload() {
             fast_open: false,
             ech: None,
             trust: ClientTrust::CaFile(cert_path),
+            fingerprint: None,
         };
         let client_listen = local_addr.clone();
         let client_upstream = tunnel_addr.clone();

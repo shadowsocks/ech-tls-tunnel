@@ -162,7 +162,7 @@ async fn sip003_full_pipeline_with_shadowsocks_rust_inner() {
 
     // ── sslocal + plugin ─────────────────────────────────────────────
     let sslocal_opts = format!(
-        "mode=client;sni=tunnel.local;path=/ws-test;ca_file={}",
+        "mode=client;sni=tunnel.local;path=/ws-test;ca_file={};fingerprint=chrome",
         cert_path.display()
     );
     let _sslocal = ChildGuard(Some(

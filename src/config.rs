@@ -26,6 +26,8 @@
 //! - `ech_config=<base64>` — or — `ech_config_file=<path>` (enables ECH)
 //! - `ca_file=<path>` (override default trust store)
 //! - `insecure=true` (DEV/TEST ONLY — disable verification)
+//! - `fingerprint=<profile>` (TLS ClientHello shaping; one of
+//!   `chrome|firefox|safari|ios|android|edge|random`)
 
 use std::path::PathBuf;
 
@@ -77,6 +79,10 @@ pub struct ClientCfg {
     pub ech: Option<ClientEch>,
     /// Trust source for verifying the upstream cert.
     pub trust: ClientTrust,
+    /// Browser-fingerprint profile for the TLS ClientHello.
+    /// `None` = boring defaults; otherwise one of the names accepted by
+    /// [`crate::fingerprint::resolve`].
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +156,7 @@ impl ClientCfg {
         let fast_open = parse_bool(o, "fast_open")?.unwrap_or(false);
         let ech = build_client_ech(o)?;
         let trust = build_client_trust(o)?;
+        let fingerprint = build_fingerprint(o)?;
 
         Ok(Self {
             sni,
@@ -157,8 +164,27 @@ impl ClientCfg {
             fast_open,
             ech,
             trust,
+            fingerprint,
         })
     }
+}
+
+fn build_fingerprint(o: &PluginOptions) -> Result<Option<String>> {
+    let Some(raw) = o.get("fingerprint") else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if crate::fingerprint::resolve(&normalized).is_none() {
+        return Err(anyhow!(
+            "unknown fingerprint {raw:?}; expected one of \
+             chrome|firefox|safari|ios|android|edge|random \
+             (or a versioned alias like chrome120, firefox120, safari16, ios14, android11, edge85)"
+        ));
+    }
+    Ok(Some(normalized))
 }
 
 fn required(o: &PluginOptions, key: &str) -> Result<String> {
@@ -453,5 +479,38 @@ mod tests {
     fn parse_bool_rejects_garbage() {
         let err = err_str("mode=server;domain=t.x;path=/ws;cert=/c;key=/k;fast_open=maybe");
         assert!(err.contains("boolean"));
+    }
+
+    #[test]
+    fn client_fingerprint_recognized_names() {
+        for fp in [
+            "chrome",
+            "Chrome",
+            "firefox",
+            "safari",
+            "ios",
+            "android",
+            "edge",
+            "random",
+            "chrome120",
+        ] {
+            let c = client_cfg(&format!("mode=client;sni=t.x;path=/ws;fingerprint={fp}"));
+            assert_eq!(c.fingerprint, Some(fp.to_ascii_lowercase()));
+        }
+    }
+
+    #[test]
+    fn client_fingerprint_default_is_none() {
+        let c = client_cfg("mode=client;sni=t.x;path=/ws");
+        assert!(c.fingerprint.is_none());
+    }
+
+    #[test]
+    fn client_fingerprint_unknown_errors() {
+        let err = err_str("mode=client;sni=t.x;path=/ws;fingerprint=netscape");
+        assert!(
+            err.contains("unknown fingerprint"),
+            "expected unknown fingerprint error, got: {err}"
+        );
     }
 }

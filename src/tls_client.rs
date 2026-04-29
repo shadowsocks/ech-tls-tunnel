@@ -14,6 +14,7 @@ use tokio_boring::SslStream;
 
 use crate::config::{ClientCfg, ClientEch, ClientTrust};
 use crate::ech;
+use crate::fingerprint;
 use crate::tls_server::alpn_wire;
 
 pub struct TlsClient {
@@ -55,6 +56,18 @@ impl TlsClient {
         }
         b.set_alpn_protos(&alpn_wire(&[b"h2", b"http/1.1"]))
             .context("set ALPN")?;
+
+        // Browser-fingerprint shaping (a.k.a. uTLS / impersonation).
+        // Applied AFTER ALPN so that the GREASE / permute behaviour is
+        // determined by the chosen profile.
+        if let Some(name) = &cfg.fingerprint {
+            let params = fingerprint::resolve(name).ok_or_else(|| {
+                anyhow!("unknown fingerprint {name:?} (config validation should have caught this)")
+            })?;
+            fingerprint::apply(&mut b, &params)
+                .with_context(|| format!("apply fingerprint {name:?}"))?;
+            tracing::info!("client TLS fingerprint: {name}");
+        }
 
         let ech_config_list = match &cfg.ech {
             None => None,
@@ -168,6 +181,7 @@ mod tests {
             fast_open: false,
             ech: None::<ClientEch>,
             trust,
+            fingerprint: None,
         }
     }
 

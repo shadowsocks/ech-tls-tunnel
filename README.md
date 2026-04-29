@@ -132,6 +132,7 @@ on the wire) like an HTTPS connection to `front.example.com`.
 | `ech_config_file` | — | Path to a binary ECHConfigList file (alternative to `ech_config`). |
 | `ca_file` | — | Pin to a specific CA bundle (PEM). Mutually exclusive with `insecure`. |
 | `insecure` | `false` | DEV/TEST ONLY — skip cert verification. |
+| `fingerprint` | — | Browser-fingerprint shaping for the TLS ClientHello. One of `chrome`, `firefox`, `safari`, `ios`, `android`, `edge`, or `random`. Versioned aliases (`chrome120`, `safari16`, …) also accepted. See [src/fingerprint.rs](src/fingerprint.rs) for the profile bodies. |
 
 ## CLI subcommands
 

@@ -9,6 +9,7 @@ pub mod challenge;
 pub mod client;
 pub mod config;
 pub mod ech;
+pub mod fingerprint;
 pub mod net;
 pub mod server;
 pub mod sip003;
