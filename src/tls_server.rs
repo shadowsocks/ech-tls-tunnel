@@ -78,7 +78,7 @@ fn build_acceptor_from_pem(cert: &Path, key: &Path) -> Result<SslAcceptor> {
 
 /// Encode an ALPN protocol list as length-prefixed concatenation:
 /// `0x02 'h' '2' 0x08 'h' 't' 't' 'p' '/' '1' '.' '1'`.
-fn alpn_wire(protos: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn alpn_wire(protos: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::with_capacity(protos.iter().map(|p| p.len() + 1).sum());
     for p in protos {
         out.push(p.len() as u8);
