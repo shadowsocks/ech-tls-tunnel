@@ -30,6 +30,7 @@ tungstenite = "0.24"
 rcgen = "0.13"
 tempfile = "3"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "time"] }
+which = "6"
 
 [profile.release]
 strip = true

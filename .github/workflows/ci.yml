@@ -33,6 +33,22 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install shadowsocks-rust (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          VER="v1.21.2"
+          curl -fsSL "https://github.com/shadowsocks/shadowsocks-rust/releases/download/${VER}/shadowsocks-${VER}.x86_64-unknown-linux-gnu.tar.xz" \
+            | tar -xJ
+          sudo mv ssserver sslocal /usr/local/bin/
+          ssserver --version
+          sslocal --version
+      - name: Install shadowsocks-rust (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install shadowsocks-rust
+          ssserver --version
+          sslocal --version
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: cargo test
