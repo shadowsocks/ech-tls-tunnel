@@ -3,7 +3,7 @@
 ## v0.1 — TLS+WS tunnel, no ECH yet
 
 - SIP003 env-var parsing.
-- YAML config loader (server + client variants).
+- Config builder over `SS_PLUGIN_OPTIONS` (no separate config file).
 - TFO listener/connect (lifted from `https_proxy`).
 - Stealth fake-nginx 404 (lifted from `https_proxy`).
 - BoringSSL server with **static cert/key files** (no ACME yet).
