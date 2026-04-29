@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.suffix }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-amd64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-arm64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }} --bin ech-tls-tunnel
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/ech-tls-tunnel" "dist/ech-tls-tunnel"
+          cp README.md LICENSE 2>/dev/null || true
+          tar -czvf "ech-tls-tunnel-${{ matrix.suffix }}.tar.gz" -C dist ech-tls-tunnel
+          shasum -a 256 "ech-tls-tunnel-${{ matrix.suffix }}.tar.gz" > "ech-tls-tunnel-${{ matrix.suffix }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ech-tls-tunnel-${{ matrix.suffix }}
+          path: |
+            ech-tls-tunnel-${{ matrix.suffix }}.tar.gz
+            ech-tls-tunnel-${{ matrix.suffix }}.tar.gz.sha256
+
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Show artifacts
+        run: ls -la artifacts/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
+          generate_release_notes: true
