@@ -16,7 +16,8 @@ use tokio::net::TcpStream;
 use tokio_boring::SslStream;
 
 use crate::challenge::ChallengeStore;
-use crate::config::{ServerCfg, ServerTls};
+use crate::config::{ServerCfg, ServerEch, ServerTls};
+use crate::ech::EchServerKey;
 
 /// Live TLS acceptor backed by BoringSSL. The inner [`SslAcceptor`] sits
 /// behind `ArcSwap` so the ACME task can hot-swap it on cert renewal.
@@ -51,7 +52,7 @@ impl TlsServer {
                 ))
             }
         };
-        let acceptor = build_acceptor_from_pem(cert_file, key_file, challenges)?;
+        let acceptor = build_acceptor_from_pem(cert_file, key_file, challenges, cfg.ech.as_ref())?;
         Ok(Self {
             acceptor: Arc::new(ArcSwap::from_pointee(acceptor)),
         })
@@ -59,13 +60,15 @@ impl TlsServer {
 
     /// Build from cert/key already in memory (PEM strings) plus a
     /// `ChallengeStore`. Used by the ACME path which has just received
-    /// a freshly-issued cert.
+    /// a freshly-issued cert. Reads ECH config from `cfg.ech` if any.
     pub fn build_from_pem_with(
+        cfg: &ServerCfg,
         cert_pem: &str,
         key_pem: &str,
         challenges: Arc<ChallengeStore>,
     ) -> Result<Self> {
-        let acceptor = build_acceptor_from_pem_strs(cert_pem, key_pem, challenges)?;
+        let acceptor =
+            build_acceptor_from_pem_strs(cert_pem, key_pem, challenges, cfg.ech.as_ref())?;
         Ok(Self {
             acceptor: Arc::new(ArcSwap::from_pointee(acceptor)),
         })
@@ -89,6 +92,7 @@ fn build_acceptor_from_pem(
     cert: &Path,
     key: &Path,
     challenges: Arc<ChallengeStore>,
+    ech: Option<&ServerEch>,
 ) -> Result<SslAcceptor> {
     let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .context("init SslAcceptorBuilder")?;
@@ -98,6 +102,7 @@ fn build_acceptor_from_pem(
         .with_context(|| format!("load key {}", key.display()))?;
     b.check_private_key().context("cert/key pair check")?;
     install_alpn_callback(&mut b, challenges)?;
+    install_ech_if_configured(&b, ech)?;
     Ok(b.build())
 }
 
@@ -105,6 +110,7 @@ fn build_acceptor_from_pem_strs(
     cert_pem: &str,
     key_pem: &str,
     challenges: Arc<ChallengeStore>,
+    ech: Option<&ServerEch>,
 ) -> Result<SslAcceptor> {
     use boring::pkey::PKey;
     use boring::x509::X509;
@@ -122,7 +128,30 @@ fn build_acceptor_from_pem_strs(
     b.set_private_key(&pkey).context("set private key")?;
     b.check_private_key().context("cert/key pair check")?;
     install_alpn_callback(&mut b, challenges)?;
+    install_ech_if_configured(&b, ech)?;
     Ok(b.build())
+}
+
+/// Read the HPKE keypair from `ech.key_file` and install it on the
+/// builder via `SSL_CTX_set1_ech_keys`. No-op when ECH isn't
+/// configured.
+fn install_ech_if_configured(
+    b: &boring::ssl::SslContextBuilder,
+    ech: Option<&ServerEch>,
+) -> Result<()> {
+    let Some(cfg) = ech else { return Ok(()) };
+    let key = EchServerKey::read_from(&cfg.key_file)
+        .with_context(|| format!("read ECH key {}", cfg.key_file.display()))?;
+    if key.public_name() != cfg.public_name {
+        tracing::warn!(
+            "ECH public_name mismatch: stored={:?}, config={:?}",
+            key.public_name(),
+            cfg.public_name
+        );
+    }
+    key.install_on_ctx_builder(b)?;
+    tracing::info!("ECH enabled (public_name={})", key.public_name());
+    Ok(())
 }
 
 /// Install the ALPN-select callback that:
@@ -322,6 +351,7 @@ mod tests {
             &cert_path,
             &key_path,
             Arc::new(crate::challenge::ChallengeStore::new()),
+            None,
         )
         .unwrap();
         server.swap(new_acceptor);

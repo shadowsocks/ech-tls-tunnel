@@ -8,6 +8,7 @@ pub mod acme;
 pub mod challenge;
 pub mod client;
 pub mod config;
+pub mod ech;
 pub mod net;
 pub mod server;
 pub mod sip003;

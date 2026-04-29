@@ -12,11 +12,14 @@ use boring::x509::X509;
 use tokio::net::TcpStream;
 use tokio_boring::SslStream;
 
-use crate::config::{ClientCfg, ClientTrust};
+use crate::config::{ClientCfg, ClientEch, ClientTrust};
+use crate::ech;
 use crate::tls_server::alpn_wire;
 
 pub struct TlsClient {
     connector: Arc<SslConnector>,
+    /// Binary ECHConfigList to apply per-connection. `None` disables ECH.
+    ech_config_list: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for TlsClient {
@@ -52,19 +55,46 @@ impl TlsClient {
         }
         b.set_alpn_protos(&alpn_wire(&[b"h2", b"http/1.1"]))
             .context("set ALPN")?;
+
+        let ech_config_list = match &cfg.ech {
+            None => None,
+            Some(ClientEch::Inline(b64)) => Some(ech::decode_config_list_b64(b64)?),
+            Some(ClientEch::File(path)) => Some(
+                std::fs::read(path)
+                    .with_context(|| format!("read ECH config list {}", path.display()))?,
+            ),
+        };
+
         Ok(Self {
             connector: Arc::new(b.build()),
+            ech_config_list,
         })
     }
 
     /// Open a TLS connection over an already-connected TCP stream.
-    /// `sni` is the server name presented in the ClientHello (and used
-    /// for hostname verification when trust isn't `InsecureSkipVerify`).
+    /// `sni` is the server name presented in the (inner) ClientHello and
+    /// used for hostname verification when trust isn't
+    /// `InsecureSkipVerify`. When ECH is enabled the outer SNI is
+    /// derived from the configured `public_name` inside the
+    /// ECHConfigList.
     pub async fn connect(&self, sni: &str, tcp: TcpStream) -> Result<SslStream<TcpStream>> {
         let cfg = self.connector.configure().context("configure handshake")?;
-        tokio_boring::connect(cfg, sni, tcp)
-            .await
-            .map_err(|e| anyhow!("tls handshake: {e}"))
+        match &self.ech_config_list {
+            None => tokio_boring::connect(cfg, sni, tcp)
+                .await
+                .map_err(|e| anyhow!("tls handshake: {e}")),
+            Some(list) => {
+                let mut ssl = cfg
+                    .into_ssl(sni)
+                    .context("ConnectConfiguration::into_ssl")?;
+                ech::install_client_ech_config_list(&mut ssl, list)
+                    .context("install client ECH config list")?;
+                tokio_boring::SslStreamBuilder::new(ssl, tcp)
+                    .connect()
+                    .await
+                    .map_err(|e| anyhow!("tls handshake (ECH): {e}"))
+            }
+        }
     }
 }
 
