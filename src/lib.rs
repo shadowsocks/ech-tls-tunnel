@@ -10,3 +10,4 @@ pub mod sip003;
 pub mod stealth;
 pub mod tls_client;
 pub mod tls_server;
+pub mod ws;
