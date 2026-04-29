@@ -5,4 +5,5 @@
 //! the milestone breakdown.
 
 pub mod net;
+pub mod sip003;
 pub mod stealth;
