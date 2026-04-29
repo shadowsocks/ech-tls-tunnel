@@ -1,0 +1,24 @@
+[package]
+name = "ech-tls-tunnel"
+version = "0.1.0-dev"
+edition = "2021"
+description = "SIP003 plugin: shadowsocks over WebSocket / TLS / ECH with ACME auto-renewal"
+license = "MIT"
+repository = "https://github.com/shadowsocks/ech-tls-tunnel"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "time"] }
+
+[profile.release]
+strip = true
+lto = true
