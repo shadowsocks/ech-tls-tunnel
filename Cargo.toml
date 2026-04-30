@@ -20,7 +20,7 @@ http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-instant-acme = "0.7"
+instant-acme = "0.8"
 libc = "0.2"
 pin-project-lite = "0.2"
 rand = "0.8"

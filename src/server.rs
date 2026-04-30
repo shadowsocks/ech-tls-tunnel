@@ -23,7 +23,7 @@ use crate::challenge::ChallengeStore;
 use crate::config::{ServerCfg, ServerTls};
 use crate::net;
 use crate::stealth;
-use crate::tls_server::TlsServer;
+use crate::tls_server::{build_acceptor_from_pem_strs_pub, TlsServer};
 use crate::ws::WsByteStream;
 
 /// Bind, accept, and serve until the listener errors. `listen_addr` is
@@ -32,8 +32,84 @@ use crate::ws::WsByteStream;
 /// (`SS_LOCAL_HOST:SS_LOCAL_PORT`).
 pub async fn run(listen_addr: &str, upstream_addr: &str, cfg: ServerCfg) -> Result<()> {
     let challenges = Arc::new(ChallengeStore::new());
-    let tls = Arc::new(build_tls_server(&cfg, challenges.clone()).await?);
+    // Bind the listener BEFORE running ACME: TLS-ALPN-01 validation
+    // requires the port-443 listener to be live (with the ALPN-select
+    // callback consulting `challenges`) when LE connects to validate.
     let listener = net::create_listener(listen_addr, cfg.fast_open).await?;
+    let tls = Arc::new(build_initial_tls(&cfg, challenges.clone())?);
+
+    // ACME mode: kick off issuance / renewal in the background. Until
+    // issuance completes the bootstrap (self-signed) acceptor handles
+    // TLS-ALPN-01 challenges; once the production cert is ready we hot-swap.
+    if let ServerTls::Acme {
+        email,
+        staging,
+        cache_dir,
+    } = &cfg.tls
+    {
+        let domains = compute_acme_domains(&cfg);
+        let cached = acme::load_cached(cache_dir);
+        let cfg_for_task = cfg.clone();
+        let challenges_for_task = challenges.clone();
+        let tls_for_task = tls.clone();
+        let email = email.clone();
+        let staging = *staging;
+        let cache_dir = cache_dir.clone();
+
+        if let Some(material) = cached {
+            tracing::info!("using cached cert from {}", cache_dir.display());
+            install_material(
+                &tls_for_task,
+                &cfg_for_task,
+                &material,
+                &challenges_for_task,
+            )?;
+            let cb = make_swap_cb(tls_for_task, cfg_for_task, challenges_for_task.clone());
+            acme::spawn_renewal_task(domains, email, staging, cache_dir, challenges_for_task, cb);
+        } else {
+            tracing::info!("issuing new cert via ACME (TLS-ALPN-01) for {domains:?}");
+            tokio::spawn(async move {
+                let domains_ref: Vec<&str> = domains.iter().map(String::as_str).collect();
+                match acme::issue(
+                    &domains_ref,
+                    &email,
+                    staging,
+                    &cache_dir,
+                    None,
+                    challenges_for_task.clone(),
+                )
+                .await
+                {
+                    Ok(material) => {
+                        if let Err(e) = install_material(
+                            &tls_for_task,
+                            &cfg_for_task,
+                            &material,
+                            &challenges_for_task,
+                        ) {
+                            tracing::error!("install ACME cert failed: {e:#}");
+                            return;
+                        }
+                        tracing::info!("ACME cert installed; production traffic now live");
+                        let cb =
+                            make_swap_cb(tls_for_task, cfg_for_task, challenges_for_task.clone());
+                        acme::spawn_renewal_task(
+                            domains,
+                            email,
+                            staging,
+                            cache_dir,
+                            challenges_for_task,
+                            cb,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("ACME issuance failed: {e:#}");
+                    }
+                }
+            });
+        }
+    }
+
     let cfg = Arc::new(cfg);
     let upstream = Arc::<str>::from(upstream_addr);
 
@@ -132,46 +208,72 @@ async fn handle_request(
         .expect("static 101 response is valid"))
 }
 
-/// Build a [`TlsServer`] from the config, dispatching on
-/// [`ServerTls::Static`] vs [`ServerTls::Acme`]. The ACME path may
-/// block on a network roundtrip to issue/refresh the cert.
-async fn build_tls_server(cfg: &ServerCfg, challenges: Arc<ChallengeStore>) -> Result<TlsServer> {
+/// Build the [`TlsServer`] used by the listener at startup. Static
+/// mode loads the cert/key from disk; ACME mode returns a *bootstrap*
+/// acceptor (self-signed throwaway cert as default) so the listener
+/// can come up immediately and serve TLS-ALPN-01 challenges while ACME
+/// runs in the background. The caller hot-swaps to the production
+/// cert once issuance succeeds.
+fn build_initial_tls(cfg: &ServerCfg, challenges: Arc<ChallengeStore>) -> Result<TlsServer> {
     match &cfg.tls {
         ServerTls::Static { .. } => TlsServer::build_static_with(cfg, challenges),
-        ServerTls::Acme {
-            email,
-            staging,
-            cache_dir,
-        } => {
-            let mut domains: Vec<&str> = vec![cfg.domain.as_str()];
-            if let Some(ech) = &cfg.ech {
-                if !ech.public_name.is_empty() && ech.public_name != cfg.domain {
-                    domains.push(ech.public_name.as_str());
-                }
-            }
-            let cert = match acme::load_cached(cache_dir) {
-                Some(c) => {
-                    tracing::info!("using cached cert from {}", cache_dir.display());
-                    c
-                }
-                None => {
-                    tracing::info!("issuing new cert via ACME (TLS-ALPN-01) for {domains:?}");
-                    acme::issue(
-                        &domains,
-                        email,
-                        *staging,
-                        cache_dir,
-                        None,
-                        challenges.clone(),
-                    )
-                    .await?
-                }
-            };
-            let server =
-                TlsServer::build_from_pem_with(cfg, &cert.cert_pem, &cert.key_pem, challenges)?;
-            Ok(server)
+        ServerTls::Acme { .. } => TlsServer::build_bootstrap_with(cfg, challenges),
+    }
+}
+
+/// Compute the SAN list for the ACME order: the real tunnel `domain`,
+/// plus the ECH `public_name` if set and distinct.
+fn compute_acme_domains(cfg: &ServerCfg) -> Vec<String> {
+    let mut out = vec![cfg.domain.clone()];
+    if let Some(ech) = &cfg.ech {
+        if !ech.public_name.is_empty() && ech.public_name != cfg.domain {
+            out.push(ech.public_name.clone());
         }
     }
+    out
+}
+
+/// Build an `SslAcceptor` from the freshly-issued PEM material and
+/// hot-swap it into the live `TlsServer`.
+fn install_material(
+    tls: &TlsServer,
+    cfg: &ServerCfg,
+    material: &acme::CertMaterial,
+    challenges: &Arc<ChallengeStore>,
+) -> Result<()> {
+    let acceptor = build_acceptor_from_pem_strs_pub(
+        &material.cert_pem,
+        &material.key_pem,
+        challenges.clone(),
+        cfg.ech.as_ref(),
+    )?;
+    tls.swap(acceptor);
+    Ok(())
+}
+
+/// Build the `on_new` callback handed to [`acme::spawn_renewal_task`]:
+/// rebuilds the acceptor from the renewed PEM and swaps it in. The
+/// rebuilt acceptor reuses the same `ChallengeStore` so subsequent
+/// renewals can again share the production listener for TLS-ALPN-01.
+fn make_swap_cb(
+    tls: Arc<TlsServer>,
+    cfg: ServerCfg,
+    challenges: Arc<ChallengeStore>,
+) -> Arc<dyn Fn(acme::CertMaterial) + Send + Sync> {
+    Arc::new(move |material: acme::CertMaterial| {
+        match build_acceptor_from_pem_strs_pub(
+            &material.cert_pem,
+            &material.key_pem,
+            challenges.clone(),
+            cfg.ech.as_ref(),
+        ) {
+            Ok(acceptor) => {
+                tls.swap(acceptor);
+                tracing::info!("renewed cert installed");
+            }
+            Err(e) => tracing::error!("renewal swap failed: {e:#}"),
+        }
+    })
 }
 
 fn is_ws_upgrade(req: &Request<Incoming>) -> bool {
