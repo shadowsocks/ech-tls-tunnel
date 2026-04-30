@@ -68,7 +68,24 @@ impl TlsServer {
         challenges: Arc<ChallengeStore>,
     ) -> Result<Self> {
         let acceptor =
-            build_acceptor_from_pem_strs(cert_pem, key_pem, challenges, cfg.ech.as_ref())?;
+            build_acceptor_from_pem_strs_pub(cert_pem, key_pem, challenges, cfg.ech.as_ref())?;
+        Ok(Self {
+            acceptor: Arc::new(ArcSwap::from_pointee(acceptor)),
+        })
+    }
+
+    /// Build a bootstrap acceptor with a self-signed throwaway cert as
+    /// the default. The ALPN+SNI callbacks still consult `challenges`,
+    /// so TLS-ALPN-01 validation works while the real ACME-issued cert
+    /// is being fetched. Real clients see an untrusted cert until the
+    /// production cert is swapped in.
+    pub fn build_bootstrap_with(cfg: &ServerCfg, challenges: Arc<ChallengeStore>) -> Result<Self> {
+        let kp = rcgen::generate_simple_self_signed(vec![cfg.domain.clone()])
+            .context("generate bootstrap self-signed cert")?;
+        let cert_pem = kp.cert.pem();
+        let key_pem = kp.key_pair.serialize_pem();
+        let acceptor =
+            build_acceptor_from_pem_strs_pub(&cert_pem, &key_pem, challenges, cfg.ech.as_ref())?;
         Ok(Self {
             acceptor: Arc::new(ArcSwap::from_pointee(acceptor)),
         })
@@ -104,6 +121,17 @@ fn build_acceptor_from_pem(
     install_alpn_callback(&mut b, challenges)?;
     install_ech_if_configured(&b, ech)?;
     Ok(b.build())
+}
+
+/// Crate-public variant so [`crate::server`] can build a fresh acceptor
+/// from a freshly-issued ACME cert and hot-swap it via [`TlsServer::swap`].
+pub(crate) fn build_acceptor_from_pem_strs_pub(
+    cert_pem: &str,
+    key_pem: &str,
+    challenges: Arc<ChallengeStore>,
+    ech: Option<&ServerEch>,
+) -> Result<SslAcceptor> {
+    build_acceptor_from_pem_strs(cert_pem, key_pem, challenges, ech)
 }
 
 fn build_acceptor_from_pem_strs(

@@ -86,54 +86,55 @@ pub async fn issue(
         }
     });
 
-    let (account, _credentials) = Account::create(
-        &NewAccount {
-            contact: &[&format!("mailto:{email}")],
-            terms_of_service_agreed: true,
-            only_return_existing: false,
-        },
-        &directory,
-        None,
-    )
-    .await
-    .context("create ACME account")?;
+    let (account, _credentials) = Account::builder()
+        .context("init ACME account builder")?
+        .create(
+            &NewAccount {
+                contact: &[&format!("mailto:{email}")],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            directory,
+            None,
+        )
+        .await
+        .context("create ACME account")?;
 
     let identifiers: Vec<Identifier> = domains
         .iter()
         .map(|d| Identifier::Dns((*d).to_string()))
         .collect();
     let mut order = account
-        .new_order(&NewOrder {
-            identifiers: &identifiers,
-        })
+        .new_order(&NewOrder::new(&identifiers))
         .await
         .context("new order")?;
 
-    let authorizations = order.authorizations().await.context("get authorizations")?;
-    let mut active_challenges = Vec::new();
-    for authz in &authorizations {
-        if authz.status != AuthorizationStatus::Pending {
-            continue;
+    let mut active_domains: Vec<String> = Vec::new();
+    {
+        let mut authzs = order.authorizations();
+        loop {
+            match authzs.next().await {
+                None => break,
+                Some(Err(e)) => return Err(anyhow!("get authorization: {e}")),
+                Some(Ok(mut authz)) => {
+                    if authz.status != AuthorizationStatus::Pending {
+                        continue;
+                    }
+                    let domain = match authz.identifier().identifier {
+                        Identifier::Dns(d) => d.clone(),
+                        other => return Err(anyhow!("unexpected identifier {other:?}")),
+                    };
+                    let mut challenge = authz
+                        .challenge(ChallengeType::TlsAlpn01)
+                        .ok_or_else(|| anyhow!("no tls-alpn-01 challenge for {domain}"))?;
+                    let key_auth = challenge.key_authorization();
+                    let ctx = build_challenge_ctx(&domain, &key_auth)?;
+                    challenges.install(domain.clone(), ctx);
+                    challenge.set_ready().await.context("set challenge ready")?;
+                    active_domains.push(domain);
+                }
+            }
         }
-        let challenge = authz
-            .challenges
-            .iter()
-            .find(|c| c.r#type == ChallengeType::TlsAlpn01)
-            .ok_or_else(|| anyhow!("no tls-alpn-01 challenge for {:?}", authz.identifier))?;
-        let key_auth = order.key_authorization(challenge);
-        let domain = match &authz.identifier {
-            Identifier::Dns(d) => d.clone(),
-        };
-        let ctx = build_challenge_ctx(&domain, &key_auth)?;
-        challenges.install(domain.clone(), ctx);
-        active_challenges.push((challenge.url.clone(), domain));
-    }
-
-    for (url, _) in &active_challenges {
-        order
-            .set_challenge_ready(url)
-            .await
-            .context("set challenge ready")?;
     }
 
     // Poll until ready or invalid (~2 minutes max).
@@ -143,7 +144,7 @@ pub async fn issue(
     }
 
     // Cleanup challenge entries.
-    for (_, domain) in &active_challenges {
+    for domain in &active_domains {
         challenges.remove(domain);
     }
 
@@ -159,7 +160,10 @@ pub async fn issue(
         .der()
         .to_vec();
 
-    order.finalize(&csr_der).await.context("finalize order")?;
+    order
+        .finalize_csr(&csr_der)
+        .await
+        .context("finalize order")?;
 
     // Wait for the cert to be issued (~30s max).
     let cert_chain_pem = poll_until_certificate(&mut order, 30, Duration::from_secs(2)).await?;
