@@ -168,6 +168,8 @@ mod tests {
                 key_file: key_path,
             },
             ech: None::<ServerEch>,
+            acme_cover_san: true,
+            reject_non_ech: true,
             server_name: "nginx/1.24.0".into(),
         };
         let server = TlsServer::build_static(&cfg).unwrap();

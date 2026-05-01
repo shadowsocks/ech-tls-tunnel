@@ -304,6 +304,8 @@ mod tests {
                 key_file: key_path,
             },
             ech: None::<ServerEch>,
+            acme_cover_san: true,
+            reject_non_ech: true,
             server_name: "nginx/1.24.0".into(),
         }
     }
@@ -360,6 +362,8 @@ mod tests {
                 cache_dir: "/tmp".into(),
             },
             ech: None,
+            acme_cover_san: true,
+            reject_non_ech: true,
             server_name: "nginx/1.24.0".into(),
         };
         let err = TlsServer::build_static(&cfg).unwrap_err();

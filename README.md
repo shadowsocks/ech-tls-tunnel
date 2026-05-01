@@ -119,7 +119,9 @@ on the wire) like an HTTPS connection to `front.example.com`.
 | `acme_email` | — | Contact email; enables ACME (Let's Encrypt) via TLS-ALPN-01. |
 | `acme_cache` | `/var/lib/ech-tls-tunnel/acme` | Where the ACME account + cert live across restarts. |
 | `acme_staging` | `false` | Use Let's Encrypt staging — set `true` while testing to avoid rate limits. |
-| `ech_public_name` | — | Outer SNI advertised to public observers. Required (with `ech_key`) to enable ECH. |
+| `acme_cover_san` | `true` | Include `ech_public_name` as a SAN on the ACME cert. Set `false` when the cover name is a domain you don't own (e.g. `www.baidu.com`); the cert then only covers `domain`. |
+| `ech_public_name` | — | Outer SNI advertised to public observers. Required (with `ech_key`) to enable ECH. Owning the name (with a SAN on the cert) holds up under active probing; an unowned cover name only hides the SNI from passive observers. |
+| `reject_non_ech` | `true` | Only meaningful when ECH is enabled. TCP-RST any inbound TLS handshake whose ClientHello lacks the `encrypted_client_hello` extension (and isn't an ACME `acme-tls/1` validator), so active probes can't observe the production cert. |
 | `ech_key` | — | Path to the HPKE private key from `ech-gen-keys`. |
 | `server_name` | `nginx/1.24.0` | Value of the `Server` header in fake-404 responses. |
 

@@ -18,7 +18,15 @@
 //! - `acme_email=<addr>` (auto cert via Let's Encrypt)
 //! - `acme_cache=<dir>` (default `/var/lib/ech-tls-tunnel/acme`)
 //! - `acme_staging=true|false` (default `false`)
+//! - `acme_cover_san=true|false` (default `true`) — include
+//!   `ech_public_name` as a SAN on the ACME cert. Set to `false` when
+//!   the cover name is a domain you don't own (e.g. `www.baidu.com`)
+//!   so the order only requests a cert for `domain`.
 //! - `ech_public_name=<name>` + `ech_key=<path>` (both required for ECH)
+//! - `reject_non_ech=true|false` (default `true`, only meaningful when
+//!   ECH is enabled) — TCP-RST any inbound TLS handshake that lacks
+//!   the ECH extension (and isn't an ACME `acme-tls/1` validator), so
+//!   active probes don't observe the production cert.
 //! - `server_name=<header value>` (default `nginx/1.24.0`)
 //!
 //! Client (`mode=client`):
@@ -63,6 +71,13 @@ pub struct ServerCfg {
     pub tls: ServerTls,
     /// ECH HPKE keys; `None` disables ECH.
     pub ech: Option<ServerEch>,
+    /// Include `ech_public_name` as a SAN on the ACME cert when distinct
+    /// from `domain`. Set `false` when the cover name is a domain you
+    /// don't own — ACME issuance would otherwise fail.
+    pub acme_cover_san: bool,
+    /// When ECH is enabled, drop (TCP-RST) inbound TLS handshakes that
+    /// don't carry the ECH extension and aren't ACME validators.
+    pub reject_non_ech: bool,
     /// `Server` header value for fake-404 responses.
     pub server_name: String,
 }
@@ -133,6 +148,8 @@ impl ServerCfg {
         let fast_open = parse_bool(o, "fast_open")?.unwrap_or(false);
         let tls = build_server_tls(o)?;
         let ech = build_server_ech(o)?;
+        let acme_cover_san = parse_bool(o, "acme_cover_san")?.unwrap_or(true);
+        let reject_non_ech = parse_bool(o, "reject_non_ech")?.unwrap_or(true);
         let server_name = o
             .get("server_name")
             .map(str::to_string)
@@ -144,6 +161,8 @@ impl ServerCfg {
             fast_open,
             tls,
             ech,
+            acme_cover_san,
+            reject_non_ech,
             server_name,
         })
     }
@@ -381,6 +400,36 @@ mod tests {
             err_str("mode=server;domain=t.x;path=/ws;cert=/c;key=/k;ech_key=/e.key")
                 .contains("ech_public_name")
         );
+    }
+
+    #[test]
+    fn server_acme_cover_san_default_true() {
+        let c = server_cfg(
+            "mode=server;domain=t.x;path=/ws;acme_email=a@b.c;\
+             ech_public_name=front.x;ech_key=/e.key",
+        );
+        assert!(c.acme_cover_san);
+    }
+
+    #[test]
+    fn server_acme_cover_san_opt_out() {
+        let c = server_cfg(
+            "mode=server;domain=t.x;path=/ws;acme_email=a@b.c;\
+             ech_public_name=www.baidu.com;ech_key=/e.key;acme_cover_san=false",
+        );
+        assert!(!c.acme_cover_san);
+    }
+
+    #[test]
+    fn server_reject_non_ech_default_true() {
+        let c = server_cfg("mode=server;domain=t.x;path=/ws;cert=/c;key=/k");
+        assert!(c.reject_non_ech);
+    }
+
+    #[test]
+    fn server_reject_non_ech_opt_out() {
+        let c = server_cfg("mode=server;domain=t.x;path=/ws;cert=/c;key=/k;reject_non_ech=false");
+        assert!(!c.reject_non_ech);
     }
 
     #[test]

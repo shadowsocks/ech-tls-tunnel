@@ -91,6 +91,8 @@ async fn full_loop_round_trips_payload() {
                 key_file: key_path,
             },
             ech: None,
+            acme_cover_san: true,
+            reject_non_ech: true,
             server_name: "nginx/1.24.0".into(),
         };
         let server_listen = tunnel_addr.clone();
@@ -157,6 +159,8 @@ async fn unmatched_path_serves_fake_404() {
                 key_file: key_path,
             },
             ech: None,
+            acme_cover_san: true,
+            reject_non_ech: true,
             server_name: "nginx/1.24.0".into(),
         };
         let listen = tunnel_addr.clone();
