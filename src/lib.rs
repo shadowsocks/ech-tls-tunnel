@@ -7,6 +7,7 @@
 pub mod acme;
 pub mod challenge;
 pub mod client;
+pub mod clienthello;
 pub mod config;
 pub mod ech;
 pub mod fingerprint;

@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 
 use crate::acme;
 use crate::challenge::ChallengeStore;
+use crate::clienthello::{self, ClientHelloKind};
 use crate::config::{ServerCfg, ServerTls};
 use crate::net;
 use crate::stealth;
@@ -127,6 +128,11 @@ pub async fn run(listen_addr: &str, upstream_addr: &str, cfg: ServerCfg) -> Resu
         let upstream = upstream.clone();
 
         tokio::spawn(async move {
+            if cfg.ech.is_some() && cfg.reject_non_ech && !is_ech_or_acme_handshake(&tcp).await {
+                rst_drop(tcp);
+                debug!("{peer}: dropped non-ECH handshake");
+                return;
+            }
             let stream = match tls.accept(tcp).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -222,12 +228,16 @@ fn build_initial_tls(cfg: &ServerCfg, challenges: Arc<ChallengeStore>) -> Result
 }
 
 /// Compute the SAN list for the ACME order: the real tunnel `domain`,
-/// plus the ECH `public_name` if set and distinct.
+/// plus the ECH `public_name` if set, distinct, and `acme_cover_san`
+/// is on. Users with an unowned cover name (e.g. `www.baidu.com`) must
+/// set `acme_cover_san=false` so the order only requests `domain`.
 fn compute_acme_domains(cfg: &ServerCfg) -> Vec<String> {
     let mut out = vec![cfg.domain.clone()];
-    if let Some(ech) = &cfg.ech {
-        if !ech.public_name.is_empty() && ech.public_name != cfg.domain {
-            out.push(ech.public_name.clone());
+    if cfg.acme_cover_san {
+        if let Some(ech) = &cfg.ech {
+            if !ech.public_name.is_empty() && ech.public_name != cfg.domain {
+                out.push(ech.public_name.clone());
+            }
         }
     }
     out
@@ -274,6 +284,51 @@ fn make_swap_cb(
             Err(e) => tracing::error!("renewal swap failed: {e:#}"),
         }
     })
+}
+
+/// Peek up to 8 KiB and decide whether the inbound bytes look like a
+/// ClientHello carrying ECH (real client) or `acme-tls/1` ALPN (Let's
+/// Encrypt validator). Returns `false` for anything else, including
+/// reads that time out before a full ClientHello arrives.
+async fn is_ech_or_acme_handshake(tcp: &tokio::net::TcpStream) -> bool {
+    use std::time::Duration;
+
+    const PEEK_CAP: usize = 8 * 1024;
+    const PEEK_BUDGET: Duration = Duration::from_secs(5);
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    let mut buf = vec![0u8; PEEK_CAP];
+    let deadline = tokio::time::Instant::now() + PEEK_BUDGET;
+    let mut last_n = 0usize;
+    loop {
+        let read = tokio::time::timeout_at(deadline, tcp.peek(&mut buf)).await;
+        let n = match read {
+            Ok(Ok(0)) => return false,
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) | Err(_) => return false,
+        };
+        match clienthello::classify(&buf[..n]) {
+            ClientHelloKind::EchOrAcmeAlpn => return true,
+            ClientHelloKind::NotTls | ClientHelloKind::Other => return false,
+            ClientHelloKind::Incomplete => {
+                if n == buf.len() || tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                if n == last_n {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                last_n = n;
+            }
+        }
+    }
+}
+
+/// Force a TCP RST on the dropped socket so the peer cannot tell our
+/// production cert apart from a hung listener.
+fn rst_drop(tcp: tokio::net::TcpStream) {
+    let sock = socket2::SockRef::from(&tcp);
+    let _ = sock.set_linger(Some(std::time::Duration::ZERO));
+    drop(tcp);
 }
 
 fn is_ws_upgrade(req: &Request<Incoming>) -> bool {
