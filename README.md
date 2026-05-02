@@ -33,14 +33,20 @@ Pick a release binary from the
 extract, and put `ech-tls-tunnel` somewhere on `PATH`:
 
 ```sh
-# Linux x86_64
+# Linux x86_64 (glibc — Ubuntu/Debian/RHEL/etc.)
 curl -L https://github.com/shadowsocks/ech-tls-tunnel/releases/latest/download/ech-tls-tunnel-linux-amd64.tar.gz | tar xz
+sudo mv ech-tls-tunnel /usr/local/bin/
+
+# Linux x86_64 (musl, fully static — Alpine, OpenWrt, embedded)
+curl -L https://github.com/shadowsocks/ech-tls-tunnel/releases/latest/download/ech-tls-tunnel-linux-amd64-musl.tar.gz | tar xz
 sudo mv ech-tls-tunnel /usr/local/bin/
 
 # macOS arm64
 curl -L https://github.com/shadowsocks/ech-tls-tunnel/releases/latest/download/ech-tls-tunnel-darwin-arm64.tar.gz | tar xz
 sudo mv ech-tls-tunnel /usr/local/bin/
 ```
+
+`linux-arm64` and `linux-arm64-musl` builds are also published.
 
 Or build from source:
 
