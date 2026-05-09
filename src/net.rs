@@ -17,6 +17,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(target_os = "linux")]
 use tracing::info;
+#[cfg(not(target_os = "linux"))]
 use tracing::warn;
 
 /// Default TCP Fast Open queue length for the listening socket.
