@@ -22,8 +22,8 @@ lives in `SS_PLUGIN_OPTIONS` — no separate config file.
 
 | Variable | Example | Notes |
 |---|---|---|
-| `SERVER_HOST` | `sgp.maxlv.net` | A-record points at the VPS, port 443 free |
-| `TUNNEL_DOMAIN` | `sgp.maxlv.net` | Cert SAN; inner SNI. Usually = `SERVER_HOST` |
+| `SERVER_HOST` | `vps.example.com` | A-record points at the VPS, port 443 free |
+| `TUNNEL_DOMAIN` | `vps.example.com` | Cert SAN; inner SNI. Usually = `SERVER_HOST` |
 | `COVER_NAME` | `www.cloudflare.com` | Outer SNI seen on the wire. Can be unowned (see "Cover-name strategy") |
 | `SS_PASSWORD` | `<32+ random chars>` | Shared secret. `openssl rand -base64 24` works |
 | `SS_METHOD` | `aes-128-gcm` | Any cipher both ends understand |
