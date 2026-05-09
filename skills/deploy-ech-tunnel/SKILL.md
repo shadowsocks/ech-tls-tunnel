@@ -92,7 +92,7 @@ ExecStart=/usr/local/bin/ssserver \\
     -k ${SS_PASSWORD} \\
     -m ${SS_METHOD} \\
     --plugin /usr/local/bin/ech-tls-tunnel \\
-    --plugin-opts "mode=server;domain=${TUNNEL_DOMAIN};path=${WS_PATH};acme_email=${ACME_EMAIL};acme_cache=/var/lib/ech-tls-tunnel/acme;ech_public_name=${COVER_NAME};ech_key=/var/lib/ech-tls-tunnel/ech-${COVER_TAG}/ech.key;acme_cover_san=false"
+    --plugin-opts "mode=server;domain=${TUNNEL_DOMAIN};path=${WS_PATH};acme_email=${ACME_EMAIL};acme_cache=/var/lib/ech-tls-tunnel/acme;ech_public_name=${COVER_NAME};ech_key=/var/lib/ech-tls-tunnel/ech-${COVER_TAG}/ech.key;acme_cover_san=false;fast_open=true"
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -121,8 +121,52 @@ Server-only plugin options summary:
 | `ech_key` | — | Path to HPKE private key from `ech-gen-keys` |
 | `reject_non_ech` | `true` | TCP-RST inbound handshakes that lack ECH (and aren't ACME validators). Defends cover from active probes. Only effective when ECH is enabled |
 | `server_name` | `nginx/1.24.0` | `Server` header on the fake-404 |
+| `fast_open` | `false` | Set `TCP_FASTOPEN` on the listening socket. Pair with the `tcp_fastopen=3` sysctl above. Saves 1 RTT per new connection on supporting clients |
 
-### 1.4 Verify
+### 1.4 Tune TCP for the tunnel (one-time, recommended)
+
+The server pushes everything through one long-lived TCP connection per
+client, so kernel-level congestion control + queue discipline matter
+more than for a typical web server. Enable BBR and TCP Fast Open, and
+raise the buffer ceilings:
+
+```sh
+cat >/etc/sysctl.d/99-ech-tls-tunnel.conf <<'EOF'
+# Congestion control: BBR + fq qdisc (BBR requires fq or fq_codel)
+net.core.default_qdisc            = fq
+net.ipv4.tcp_congestion_control   = bbr
+
+# TCP Fast Open: 3 = enable for both client (outgoing) and server (listen)
+net.ipv4.tcp_fastopen             = 3
+
+# Larger socket buffers — auto-tuned up to these caps (bytes)
+net.core.rmem_max                 = 67108864
+net.core.wmem_max                 = 67108864
+net.ipv4.tcp_rmem                 = 4096 87380 67108864
+net.ipv4.tcp_wmem                 = 4096 65536 67108864
+
+# Misc throughput hygiene
+net.ipv4.tcp_mtu_probing          = 1
+net.ipv4.tcp_notsent_lowat        = 131072
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+
+sysctl --system
+# Confirm:
+sysctl net.ipv4.tcp_congestion_control   # → bbr
+sysctl net.ipv4.tcp_fastopen             # → 3
+lsmod | grep -E 'bbr|^tcp_bbr'           # bbr module loaded
+```
+
+Notes:
+- BBR ships in every mainline kernel ≥ 4.9. If `tcp_bbr` is missing,
+  `modprobe tcp_bbr` once and add `tcp_bbr` to `/etc/modules-load.d/`.
+- `fq` is required as the qdisc — `pfifo_fast` will silently disable BBR's pacing.
+- TFO=3 covers both directions; cookies are kernel-managed, no app changes needed.
+- Buffer caps above target a 1 Gbps link with ~100 ms RTT (BDP ≈ 12 MB).
+  Lower them on memory-tight VPSes (e.g. 512 MB RAM → cap at 16 MiB).
+
+### 1.5 Verify
 
 ```sh
 systemctl is-active ssserver-ech                # active
@@ -170,7 +214,7 @@ because it contains `SS_PASSWORD`:
         <string>--protocol</string><string>http</string>
         <string>--plugin</string><string>/Users/YOU/.local/bin/ech-tls-tunnel</string>
         <string>--plugin-opts</string>
-        <string>mode=client;sni=TUNNEL_DOMAIN;path=WS_PATH;ech_config=ECH_CONFIGLIST_BASE64</string>
+        <string>mode=client;sni=TUNNEL_DOMAIN;path=WS_PATH;ech_config=ECH_CONFIGLIST_BASE64;fast_open=true</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key>
@@ -200,6 +244,7 @@ Client-only options summary:
 | `ca_file` | — | Pin a CA bundle. Mutually exclusive with `insecure` |
 | `insecure` | `false` | DEV/TEST ONLY |
 | `fingerprint` | — | `chrome\|firefox\|safari\|ios\|android\|edge\|random` for ClientHello shaping |
+| `fast_open` | `false` | Set `TCP_FASTOPEN_CONNECT` (Linux) / `TCP_FASTOPEN` (macOS). Requires the server side to also have `fast_open=true` to actually save the RTT |
 
 ### 2.3 Load & verify
 
