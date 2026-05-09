@@ -1,6 +1,6 @@
 [package]
 name = "ech-tls-tunnel"
-version = "0.1.0-dev"
+version = "0.1.1"
 edition = "2021"
 description = "SIP003 plugin: shadowsocks over WebSocket / TLS / ECH with ACME auto-renewal"
 license = "MIT"
