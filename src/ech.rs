@@ -6,9 +6,13 @@
 //! which exposes the full ECH surface (`SSL_marshal_ech_config`,
 //! `SSL_ECH_KEYS_*`, `SSL_CTX_set1_ech_keys`, `SSL_set1_ech_config_list`).
 //!
-//! Client side: a single helper that takes the binary ECHConfigList
-//! (whether decoded from base64 or read from disk) and applies it to
-//! a per-connection `SslRef` before the handshake.
+//! Client side: [`load_client_config_list`] resolves the configured
+//! source (inline base64 or a file on disk) to raw ECHConfigList bytes,
+//! and [`install_client_ech_config_list`] applies them to a
+//! per-connection `SslRef` before the handshake. Both transports use
+//! them: [`crate::tls_client`] on the `SslRef` it gets from
+//! `ConnectConfiguration::into_ssl`, and [`crate::quic`] on the one
+//! `quiche::Connection` hands out via `AsMut`.
 //!
 //! On-disk format for the server key (see [`EchServerKey::write_to`]):
 //!
@@ -28,6 +32,8 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use boring::ssl::{SslContextBuilder, SslRef};
 use foreign_types_shared::ForeignTypeRef;
+
+use crate::config::ClientEch;
 
 const X25519_PRIVATE_KEY_LEN: usize = 32;
 /// `0` lets BoringSSL pick the conventional max name length when
@@ -263,6 +269,25 @@ pub fn install_client_ech_config_list(ssl: &mut SslRef, list: &[u8]) -> Result<(
         bail!("SSL_set1_ech_config_list failed");
     }
     Ok(())
+}
+
+/// Resolve a [`ClientEch`] setting to the raw binary ECHConfigList it
+/// names, decoding base64 for [`ClientEch::Inline`] and reading the file
+/// for [`ClientEch::File`].
+pub fn load_client_config_list(cfg: &ClientEch) -> Result<Vec<u8>> {
+    match cfg {
+        ClientEch::Inline(b64) => decode_config_list_b64(b64),
+        ClientEch::File(path) => {
+            std::fs::read(path).with_context(|| format!("read ECH config list {}", path.display()))
+        }
+    }
+}
+
+/// Whether the peer's ClientHello carried an ECHClientHello that this
+/// server decrypted successfully (`SSL_ech_accepted`). Meaningful only
+/// after the handshake has completed.
+pub fn ech_accepted(ssl: &SslRef) -> bool {
+    unsafe { boring_sys::SSL_ech_accepted(ssl.as_ptr()) == 1 }
 }
 
 /// Decode a base64 ECHConfigList string.

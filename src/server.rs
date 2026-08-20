@@ -1,11 +1,17 @@
 //! Server-side event loop: terminate TLS, accept WebSocket Upgrade on
 //! the secret path, and pipe the payload bytes to the loopback
 //! `ssserver`.
+//!
+//! With `http3=true` a second listener runs alongside this one on the
+//! same `host:port` over UDP — see [`crate::h3_server`]. The two share
+//! cert material: whatever this module installs on the TCP acceptor it
+//! also publishes to the QUIC listener's [`h3_server::CertSource`], so
+//! an ACME renewal reaches both.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use http::{header, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::Full;
@@ -22,6 +28,7 @@ use crate::acme;
 use crate::challenge::ChallengeStore;
 use crate::clienthello::{self, ClientHelloKind};
 use crate::config::{ServerCfg, ServerTls};
+use crate::h3_server;
 use crate::net;
 use crate::stealth;
 use crate::tls_server::{build_acceptor_from_pem_strs_pub, TlsServer};
@@ -38,6 +45,11 @@ pub async fn run(listen_addr: &str, upstream_addr: &str, cfg: ServerCfg) -> Resu
     // callback consulting `challenges`) when LE connects to validate.
     let listener = net::create_listener(listen_addr, cfg.fast_open).await?;
     let tls = Arc::new(build_initial_tls(&cfg, challenges.clone())?);
+    let h3_certs = if cfg.http3 {
+        Some(Arc::new(build_initial_h3_certs(&cfg)?))
+    } else {
+        None
+    };
 
     // ACME mode: kick off issuance / renewal in the background. Until
     // issuance completes the bootstrap (self-signed) acceptor handles
@@ -53,6 +65,7 @@ pub async fn run(listen_addr: &str, upstream_addr: &str, cfg: ServerCfg) -> Resu
         let cfg_for_task = cfg.clone();
         let challenges_for_task = challenges.clone();
         let tls_for_task = tls.clone();
+        let h3_for_task = h3_certs.clone();
         let email = email.clone();
         let staging = *staging;
         let cache_dir = cache_dir.clone();
@@ -64,8 +77,14 @@ pub async fn run(listen_addr: &str, upstream_addr: &str, cfg: ServerCfg) -> Resu
                 &cfg_for_task,
                 &material,
                 &challenges_for_task,
+                h3_for_task.as_ref(),
             )?;
-            let cb = make_swap_cb(tls_for_task, cfg_for_task, challenges_for_task.clone());
+            let cb = make_swap_cb(
+                tls_for_task,
+                cfg_for_task,
+                challenges_for_task.clone(),
+                h3_for_task,
+            );
             acme::spawn_renewal_task(domains, email, staging, cache_dir, challenges_for_task, cb);
         } else {
             tracing::info!("issuing new cert via ACME (TLS-ALPN-01) for {domains:?}");
@@ -87,13 +106,18 @@ pub async fn run(listen_addr: &str, upstream_addr: &str, cfg: ServerCfg) -> Resu
                             &cfg_for_task,
                             &material,
                             &challenges_for_task,
+                            h3_for_task.as_ref(),
                         ) {
                             tracing::error!("install ACME cert failed: {e:#}");
                             return;
                         }
                         tracing::info!("ACME cert installed; production traffic now live");
-                        let cb =
-                            make_swap_cb(tls_for_task, cfg_for_task, challenges_for_task.clone());
+                        let cb = make_swap_cb(
+                            tls_for_task,
+                            cfg_for_task,
+                            challenges_for_task.clone(),
+                            h3_for_task,
+                        );
                         acme::spawn_renewal_task(
                             domains,
                             email,
@@ -113,6 +137,19 @@ pub async fn run(listen_addr: &str, upstream_addr: &str, cfg: ServerCfg) -> Resu
 
     let cfg = Arc::new(cfg);
     let upstream = Arc::<str>::from(upstream_addr);
+
+    if let Some(certs) = h3_certs {
+        let listen = listen_addr.to_string();
+        let up = upstream_addr.to_string();
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = h3_server::run(&listen, &up, cfg, certs).await {
+                // The TCP listener carries on without it: HTTP/3 is an
+                // addition, not a replacement.
+                tracing::error!("http/3 listener exited: {e:#}");
+            }
+        });
+    }
 
     tracing::info!("listening on {listen_addr}");
     loop {
@@ -227,6 +264,24 @@ fn build_initial_tls(cfg: &ServerCfg, challenges: Arc<ChallengeStore>) -> Result
     }
 }
 
+/// Seed the HTTP/3 listener's cert material. Static mode reads the same
+/// PEM files the TCP acceptor loads; ACME mode starts from a throwaway
+/// self-signed cert, exactly as [`build_initial_tls`] does, and gets the
+/// production one via [`install_material`] once issuance completes.
+fn build_initial_h3_certs(cfg: &ServerCfg) -> Result<h3_server::CertSource> {
+    match &cfg.tls {
+        ServerTls::Static { .. } => h3_server::CertSource::from_static_cfg(cfg),
+        ServerTls::Acme { .. } => {
+            let kp = rcgen::generate_simple_self_signed(vec![cfg.domain.clone()])
+                .context("generate bootstrap self-signed cert for http/3")?;
+            Ok(h3_server::CertSource::new(
+                kp.cert.pem(),
+                kp.key_pair.serialize_pem(),
+            ))
+        }
+    }
+}
+
 /// Compute the SAN list for the ACME order: the real tunnel `domain`,
 /// plus the ECH `public_name` if set, distinct, and `acme_cover_san`
 /// is on. Users with an unowned cover name (e.g. `www.baidu.com`) must
@@ -250,6 +305,7 @@ fn install_material(
     cfg: &ServerCfg,
     material: &acme::CertMaterial,
     challenges: &Arc<ChallengeStore>,
+    h3_certs: Option<&Arc<h3_server::CertSource>>,
 ) -> Result<()> {
     let acceptor = build_acceptor_from_pem_strs_pub(
         &material.cert_pem,
@@ -258,6 +314,9 @@ fn install_material(
         cfg.ech.as_ref(),
     )?;
     tls.swap(acceptor);
+    if let Some(certs) = h3_certs {
+        certs.swap(material.cert_pem.clone(), material.key_pem.clone());
+    }
     Ok(())
 }
 
@@ -269,6 +328,7 @@ fn make_swap_cb(
     tls: Arc<TlsServer>,
     cfg: ServerCfg,
     challenges: Arc<ChallengeStore>,
+    h3_certs: Option<Arc<h3_server::CertSource>>,
 ) -> Arc<dyn Fn(acme::CertMaterial) + Send + Sync> {
     Arc::new(move |material: acme::CertMaterial| {
         match build_acceptor_from_pem_strs_pub(
@@ -279,6 +339,9 @@ fn make_swap_cb(
         ) {
             Ok(acceptor) => {
                 tls.swap(acceptor);
+                if let Some(certs) = &h3_certs {
+                    certs.swap(material.cert_pem.clone(), material.key_pem.clone());
+                }
                 tracing::info!("renewed cert installed");
             }
             Err(e) => tracing::error!("renewal swap failed: {e:#}"),

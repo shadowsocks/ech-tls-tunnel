@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ech_tls_tunnel::client;
-use ech_tls_tunnel::config::{ClientCfg, ClientTrust, ServerCfg, ServerTls};
+use ech_tls_tunnel::config::{
+    ClientCfg, ClientEch, ClientTrust, ServerCfg, ServerEch, ServerTls, Transport,
+};
+use ech_tls_tunnel::ech::{encode_config_list_b64, EchServerKey};
 use ech_tls_tunnel::server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -40,6 +43,60 @@ async fn wait_for_ready(addr: &str) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("server at {addr} did not become ready");
+}
+
+/// The HTTP/3 listener binds UDP on the same port the TCP one uses, but
+/// from its own task — so `wait_for_ready` (which only proves the TCP
+/// side is up) isn't enough. Poll until the UDP port is taken.
+async fn wait_for_udp_ready(addr: &str) {
+    for _ in 0..40 {
+        if std::net::UdpSocket::bind(addr).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("http/3 listener at {addr} did not bind udp");
+}
+
+/// Drive one round-trip plus a 256 KB payload through an already-running
+/// client loop, the same exercise the TCP test does.
+async fn assert_round_trips(local_addr: &str) {
+    let mut sock = TcpStream::connect(local_addr).await.unwrap();
+    sock.write_all(b"ping").await.unwrap();
+    sock.flush().await.unwrap();
+    let mut buf = [0u8; 4];
+    sock.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+
+    let big: Vec<u8> = (0..256_000).map(|i| (i % 251) as u8).collect();
+    sock.write_all(&big).await.unwrap();
+    sock.flush().await.unwrap();
+    let mut got = vec![0u8; big.len()];
+    sock.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, big);
+}
+
+/// Spawn the echo server that stands in for `ssserver`.
+async fn spawn_echo() -> std::net::SocketAddr {
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = echo.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if sock.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
 }
 
 fn write_pems(dir: &std::path::Path, cert_pem: &str, key_pem: &str) -> (PathBuf, PathBuf) {
@@ -94,6 +151,7 @@ async fn full_loop_round_trips_payload() {
             acme_cover_san: true,
             reject_non_ech: true,
             server_name: "nginx/1.24.0".into(),
+            http3: false,
         };
         let server_listen = tunnel_addr.clone();
         let echo_str = echo_addr.to_string();
@@ -112,6 +170,7 @@ async fn full_loop_round_trips_payload() {
             ech: None,
             trust: ClientTrust::CaFile(cert_path),
             fingerprint: None,
+            transport: ech_tls_tunnel::config::Transport::Tcp,
         };
         let client_listen = local_addr.clone();
         let client_upstream = tunnel_addr.clone();
@@ -162,6 +221,7 @@ async fn unmatched_path_serves_fake_404() {
             acme_cover_san: true,
             reject_non_ech: true,
             server_name: "nginx/1.24.0".into(),
+            http3: false,
         };
         let listen = tunnel_addr.clone();
         tokio::spawn(async move {
@@ -206,6 +266,140 @@ async fn unmatched_path_serves_fake_404() {
             lc.contains("server: nginx/1.24.0"),
             "expected fake nginx Server header, got: {resp}"
         );
+    })
+    .await
+}
+
+/// The HTTP/3 sibling of `full_loop_round_trips_payload`: same payload,
+/// same assertions, but carried over QUIC with `http3=true` /
+/// `transport=h3` instead of TLS+WebSocket over TCP.
+#[tokio::test]
+async fn http3_loop_round_trips_payload() {
+    within_deadline("http3_loop_round_trips_payload", async {
+        let echo_addr = spawn_echo().await;
+
+        let kp = rcgen::generate_simple_self_signed(vec!["tunnel.local".into()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) =
+            write_pems(dir.path(), &kp.cert.pem(), &kp.key_pair.serialize_pem());
+
+        let tunnel_port = pick_port();
+        let tunnel_addr = format!("127.0.0.1:{tunnel_port}");
+        let server_cfg = ServerCfg {
+            domain: "tunnel.local".into(),
+            ws_path: "/ws-h3".into(),
+            fast_open: false,
+            tls: ServerTls::Static {
+                cert_file: cert_path.clone(),
+                key_file: key_path,
+            },
+            ech: None,
+            acme_cover_san: true,
+            reject_non_ech: true,
+            server_name: "nginx/1.24.0".into(),
+            http3: true,
+        };
+        let server_listen = tunnel_addr.clone();
+        let echo_str = echo_addr.to_string();
+        tokio::spawn(async move {
+            let _ = server::run(&server_listen, &echo_str, server_cfg).await;
+        });
+        wait_for_ready(&tunnel_addr).await;
+        wait_for_udp_ready(&tunnel_addr).await;
+
+        let local_port = pick_port();
+        let local_addr = format!("127.0.0.1:{local_port}");
+        let client_cfg = ClientCfg {
+            sni: "tunnel.local".into(),
+            ws_path: "/ws-h3".into(),
+            fast_open: false,
+            ech: None,
+            trust: ClientTrust::CaFile(cert_path),
+            fingerprint: None,
+            transport: Transport::H3,
+        };
+        let client_listen = local_addr.clone();
+        let client_upstream = tunnel_addr.clone();
+        tokio::spawn(async move {
+            let _ = client::run(&client_listen, &client_upstream, client_cfg).await;
+        });
+        wait_for_ready(&local_addr).await;
+
+        assert_round_trips(&local_addr).await;
+    })
+    .await
+}
+
+/// ECH over QUIC: the server publishes ECH keys on the HTTP/3 `SSL_CTX`
+/// and rejects handshakes without ECH (`reject_non_ech`), so a payload
+/// only round-trips if the client's ECHClientHello actually reached
+/// `quiche`'s BoringSSL handshake.
+#[tokio::test]
+async fn http3_loop_round_trips_payload_with_ech() {
+    within_deadline("http3_loop_round_trips_payload_with_ech", async {
+        let echo_addr = spawn_echo().await;
+
+        let kp = rcgen::generate_simple_self_signed(vec!["tunnel.local".into()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) =
+            write_pems(dir.path(), &kp.cert.pem(), &kp.key_pair.serialize_pem());
+
+        // ECH keypair: `cover.example` is the only name a passive
+        // observer gets to see in the QUIC Initial.
+        let ech_key = EchServerKey::generate("cover.example").unwrap();
+        let ech_key_path = dir.path().join("ech.key");
+        ech_key.write_to(&ech_key_path).unwrap();
+        let config_list_b64 = encode_config_list_b64(&ech_key.marshal_config_list().unwrap());
+
+        let tunnel_port = pick_port();
+        let tunnel_addr = format!("127.0.0.1:{tunnel_port}");
+        let server_cfg = ServerCfg {
+            domain: "tunnel.local".into(),
+            ws_path: "/ws-h3-ech".into(),
+            fast_open: false,
+            tls: ServerTls::Static {
+                cert_file: cert_path.clone(),
+                key_file: key_path,
+            },
+            ech: Some(ServerEch {
+                public_name: "cover.example".into(),
+                key_file: ech_key_path,
+            }),
+            acme_cover_san: false,
+            // The HTTP/3 listener enforces this via `SSL_ech_accepted`
+            // after the handshake, so a non-ECH client gets dropped
+            // before it can tunnel anything.
+            reject_non_ech: true,
+            server_name: "nginx/1.24.0".into(),
+            http3: true,
+        };
+        let server_listen = tunnel_addr.clone();
+        let echo_str = echo_addr.to_string();
+        tokio::spawn(async move {
+            let _ = server::run(&server_listen, &echo_str, server_cfg).await;
+        });
+        wait_for_ready(&tunnel_addr).await;
+        wait_for_udp_ready(&tunnel_addr).await;
+
+        let local_port = pick_port();
+        let local_addr = format!("127.0.0.1:{local_port}");
+        let client_cfg = ClientCfg {
+            sni: "tunnel.local".into(),
+            ws_path: "/ws-h3-ech".into(),
+            fast_open: false,
+            ech: Some(ClientEch::Inline(config_list_b64)),
+            trust: ClientTrust::CaFile(cert_path),
+            fingerprint: None,
+            transport: Transport::H3,
+        };
+        let client_listen = local_addr.clone();
+        let client_upstream = tunnel_addr.clone();
+        tokio::spawn(async move {
+            let _ = client::run(&client_listen, &client_upstream, client_cfg).await;
+        });
+        wait_for_ready(&local_addr).await;
+
+        assert_round_trips(&local_addr).await;
     })
     .await
 }

@@ -12,7 +12,7 @@ use boring::x509::X509;
 use tokio::net::TcpStream;
 use tokio_boring::SslStream;
 
-use crate::config::{ClientCfg, ClientEch, ClientTrust};
+use crate::config::{ClientCfg, ClientTrust};
 use crate::ech;
 use crate::fingerprint;
 use crate::tls_server::alpn_wire;
@@ -69,14 +69,11 @@ impl TlsClient {
             tracing::info!("client TLS fingerprint: {name}");
         }
 
-        let ech_config_list = match &cfg.ech {
-            None => None,
-            Some(ClientEch::Inline(b64)) => Some(ech::decode_config_list_b64(b64)?),
-            Some(ClientEch::File(path)) => Some(
-                std::fs::read(path)
-                    .with_context(|| format!("read ECH config list {}", path.display()))?,
-            ),
-        };
+        let ech_config_list = cfg
+            .ech
+            .as_ref()
+            .map(ech::load_client_config_list)
+            .transpose()?;
 
         Ok(Self {
             connector: Arc::new(b.build()),
@@ -171,6 +168,7 @@ mod tests {
             acme_cover_san: true,
             reject_non_ech: true,
             server_name: "nginx/1.24.0".into(),
+            http3: false,
         };
         let server = TlsServer::build_static(&cfg).unwrap();
         (server, cert_path)
@@ -184,6 +182,7 @@ mod tests {
             ech: None::<ClientEch>,
             trust,
             fingerprint: None,
+            transport: crate::config::Transport::Tcp,
         }
     }
 
