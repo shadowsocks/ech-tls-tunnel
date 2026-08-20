@@ -183,7 +183,10 @@ async fn session(
         // the loop keeps running while that happens.
         if let Some(req) = pending.take() {
             if h3.extended_connect_enabled_by_peer() {
-                open_stream(
+                // `open_stream` hands the request back when the peer has
+                // no stream credit for it yet; re-park and retry once the
+                // next packet moves the connection forward.
+                pending = open_stream(
                     &mut quic_conn,
                     &mut h3,
                     cfg,
@@ -285,6 +288,11 @@ async fn handshake(
 
 /// Send one WebSocket Extended CONNECT (RFC 9220) request and hand the
 /// resulting stream to the waiting accept task.
+///
+/// Returns the request back when it couldn't be sent *yet* — the QUIC
+/// stream had no capacity, or we're at the peer's concurrent-stream
+/// limit. Both clear as the connection makes progress, so the caller
+/// re-parks and retries rather than failing the connection.
 fn open_stream(
     conn: &mut quiche::Connection,
     h3: &mut quiche::h3::Connection,
@@ -293,7 +301,7 @@ fn open_stream(
     egress_tx: &mpsc::Sender<Egress>,
     read_credit: &Arc<Notify>,
     req: OpenReq,
-) {
+) -> Option<OpenReq> {
     let headers = [
         Header::new(b":method", b"CONNECT"),
         Header::new(b":protocol", b"websocket"),
@@ -306,11 +314,20 @@ fn open_stream(
 
     let sid = match h3.send_request(conn, &headers, false) {
         Ok(sid) => sid,
+        // Retryable backpressure, not failure: `StreamBlocked` means the
+        // QUIC stream has no capacity yet, `StreamLimit` that we're at the
+        // peer's concurrent-stream cap. quiche's own docs say to retry
+        // these once the connection is writable again.
+        Err(quiche::h3::Error::StreamBlocked)
+        | Err(quiche::h3::Error::TransportError(quiche::Error::StreamLimit)) => {
+            debug!("h3 send_request deferred (no stream credit yet)");
+            return Some(req);
+        }
         Err(e) => {
             // Dropping `req.reply` is the accept task's signal to close
             // the `sslocal` connection it was holding.
             warn!("h3 send_request: {e}");
-            return;
+            return None;
         }
     };
 
@@ -337,9 +354,10 @@ fn open_stream(
         streams.remove(&sid);
         let _ = conn.stream_shutdown(sid, quiche::Shutdown::Write, 0);
         let _ = conn.stream_shutdown(sid, quiche::Shutdown::Read, 0);
-        return;
+        return None;
     }
     debug!("h3 stream {sid} opened");
+    None
 }
 
 /// Drain `quiche`'s HTTP/3 event queue.
