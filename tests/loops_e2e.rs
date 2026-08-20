@@ -403,3 +403,96 @@ async fn http3_loop_round_trips_payload_with_ech() {
     })
     .await
 }
+
+/// Regression test for `send_request` backpressure. `MAX_STREAMS_BIDI`
+/// caps concurrent QUIC streams at 256, and a QUIC stream can also be
+/// momentarily out of send capacity — both surface as `StreamBlocked` /
+/// `StreamLimit` from `send_request`. Those are retryable, not fatal;
+/// treating them as fatal dropped connections under concurrency.
+///
+/// Drives 400 concurrent connections through one QUIC connection, which
+/// is comfortably past the 256 limit.
+#[tokio::test]
+async fn http3_concurrent_streams_exceed_stream_limit() {
+    within_deadline("http3_concurrent_streams_exceed_stream_limit", async {
+        let echo_addr = spawn_echo().await;
+
+        let kp = rcgen::generate_simple_self_signed(vec!["tunnel.local".into()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) =
+            write_pems(dir.path(), &kp.cert.pem(), &kp.key_pair.serialize_pem());
+
+        let tunnel_port = pick_port();
+        let tunnel_addr = format!("127.0.0.1:{tunnel_port}");
+        let server_cfg = ServerCfg {
+            domain: "tunnel.local".into(),
+            ws_path: "/ws-h3-many".into(),
+            fast_open: false,
+            tls: ServerTls::Static {
+                cert_file: cert_path.clone(),
+                key_file: key_path,
+            },
+            ech: None,
+            acme_cover_san: true,
+            reject_non_ech: true,
+            server_name: "nginx/1.24.0".into(),
+            http3: true,
+        };
+        let server_listen = tunnel_addr.clone();
+        let echo_str = echo_addr.to_string();
+        tokio::spawn(async move {
+            let _ = server::run(&server_listen, &echo_str, server_cfg).await;
+        });
+        wait_for_ready(&tunnel_addr).await;
+        wait_for_udp_ready(&tunnel_addr).await;
+
+        let local_port = pick_port();
+        let local_addr = format!("127.0.0.1:{local_port}");
+        let client_cfg = ClientCfg {
+            sni: "tunnel.local".into(),
+            ws_path: "/ws-h3-many".into(),
+            fast_open: false,
+            ech: None,
+            trust: ClientTrust::CaFile(cert_path),
+            fingerprint: None,
+            transport: Transport::H3,
+        };
+        let client_listen = local_addr.clone();
+        let client_upstream = tunnel_addr.clone();
+        tokio::spawn(async move {
+            let _ = client::run(&client_listen, &client_upstream, client_cfg).await;
+        });
+        wait_for_ready(&local_addr).await;
+
+        const N: usize = 400;
+        let mut tasks = Vec::with_capacity(N);
+        for i in 0..N {
+            let addr = local_addr.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut sock = TcpStream::connect(&addr).await?;
+                let msg = format!("{i:04}");
+                sock.write_all(msg.as_bytes()).await?;
+                sock.flush().await?;
+                let mut buf = [0u8; 4];
+                sock.read_exact(&mut buf).await?;
+                assert_eq!(&buf, msg.as_bytes(), "stream {i} echoed wrong bytes");
+                Ok::<(), std::io::Error>(())
+            }));
+        }
+
+        let mut failed = 0;
+        for (i, t) in tasks.into_iter().enumerate() {
+            match t.await.expect("task panicked") {
+                Ok(()) => {}
+                Err(e) => {
+                    failed += 1;
+                    if failed <= 3 {
+                        eprintln!("stream {i} failed: {e}");
+                    }
+                }
+            }
+        }
+        assert_eq!(failed, 0, "{failed}/{N} concurrent h3 streams failed");
+    })
+    .await
+}
