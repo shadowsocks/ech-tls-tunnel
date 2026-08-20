@@ -23,13 +23,15 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 instant-acme = "0.8"
 libc = "0.2"
 pin-project-lite = "0.2"
+quiche = "0.29"
 rand = "0.8"
 rcgen = "0.13"
 sha2 = "0.10"
 socket2 = { version = "0.5", features = ["all"] }
-tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "time"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "time", "sync"] }
 tokio-boring = "4"
 tokio-tungstenite = "0.24"
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tungstenite = "0.24"

@@ -1,5 +1,9 @@
 //! Client-side event loop: accept plain TCP from `sslocal`, dial the
 //! upstream over TLS+WS, pipe the payload bytes through.
+//!
+//! This is the `transport=tcp` path. With `transport=h3` the whole loop
+//! is replaced by [`crate::h3_client`], which carries the same payload
+//! over QUIC instead.
 
 use std::sync::Arc;
 
@@ -8,7 +12,7 @@ use tokio::io::copy_bidirectional;
 use tokio_tungstenite::client_async;
 use tracing::{debug, warn};
 
-use crate::config::ClientCfg;
+use crate::config::{ClientCfg, Transport};
 use crate::net;
 use crate::tls_client::TlsClient;
 use crate::ws::WsByteStream;
@@ -18,6 +22,10 @@ use crate::ws::WsByteStream;
 /// `upstream_addr` is the public ssserver/plugin endpoint
 /// (`SS_REMOTE_HOST:SS_REMOTE_PORT`).
 pub async fn run(listen_addr: &str, upstream_addr: &str, cfg: ClientCfg) -> Result<()> {
+    if cfg.transport == Transport::H3 {
+        return crate::h3_client::run(listen_addr, upstream_addr, cfg).await;
+    }
+
     let tls = Arc::new(TlsClient::build(&cfg)?);
     let listener = net::create_listener(listen_addr, cfg.fast_open).await?;
     let cfg = Arc::new(cfg);

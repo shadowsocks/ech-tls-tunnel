@@ -307,6 +307,7 @@ mod tests {
             acme_cover_san: true,
             reject_non_ech: true,
             server_name: "nginx/1.24.0".into(),
+            http3: false,
         }
     }
 
@@ -365,6 +366,7 @@ mod tests {
             acme_cover_san: true,
             reject_non_ech: true,
             server_name: "nginx/1.24.0".into(),
+            http3: false,
         };
         let err = TlsServer::build_static(&cfg).unwrap_err();
         assert!(format!("{err:#}").contains("ACME"));

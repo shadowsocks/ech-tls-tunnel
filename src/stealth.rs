@@ -8,20 +8,24 @@ use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::Full;
 
+/// The HTML body nginx serves for a missing page. Shared by the HTTP/1.1
+/// (`fake_404`) and HTTP/3 ([`crate::h3_server`]) stealth paths.
+pub const FAKE_404_BODY: &str = concat!(
+    "<html>\r\n",
+    "<head><title>404 Not Found</title></head>\r\n",
+    "<body>\r\n",
+    "<center><h1>404 Not Found</h1></center>\r\n",
+    "<hr><center>nginx/1.24.0</center>\r\n",
+    "</body>\r\n",
+    "</html>\r\n",
+);
+
 /// Build a fake 404 response mimicking nginx.
 ///
 /// The response sets `Server: <server_name>` and an HTML body identical
 /// to the one nginx serves for a missing page.
 pub fn fake_404(server_name: &str) -> Response<Full<Bytes>> {
-    let body = concat!(
-        "<html>\r\n",
-        "<head><title>404 Not Found</title></head>\r\n",
-        "<body>\r\n",
-        "<center><h1>404 Not Found</h1></center>\r\n",
-        "<hr><center>nginx/1.24.0</center>\r\n",
-        "</body>\r\n",
-        "</html>\r\n",
-    );
+    let body = FAKE_404_BODY;
 
     Response::builder()
         .status(StatusCode::NOT_FOUND)

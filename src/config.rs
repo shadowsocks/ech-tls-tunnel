@@ -28,6 +28,13 @@
 //!   the ECH extension (and isn't an ACME `acme-tls/1` validator), so
 //!   active probes don't observe the production cert.
 //! - `server_name=<header value>` (default `nginx/1.24.0`)
+//! - `http3=true|false` (default `false`) — in addition to the TCP
+//!   HTTP/1.1+WebSocket listener, serve the tunnel over HTTP/3 (QUIC,
+//!   via `quiche`) on the same `host:port` as a UDP listener. Clients
+//!   reach it with `transport=h3`. ECH keys are installed on both
+//!   listeners; `reject_non_ech` is enforced on both, but only the TCP
+//!   one can enforce it before the certificate goes out (see the `quic`
+//!   module docs).
 //!
 //! Client (`mode=client`):
 //! - `sni=<real-domain>` (required, inner SNI / Host)
@@ -36,6 +43,11 @@
 //! - `insecure=true` (DEV/TEST ONLY — disable verification)
 //! - `fingerprint=<profile>` (TLS ClientHello shaping; one of
 //!   `chrome|firefox|safari|ios|android|edge|random`)
+//! - `transport=tcp|h3` (default `tcp`) — `h3` dials the upstream over
+//!   HTTP/3 (QUIC), multiplexing every local connection onto one QUIC
+//!   connection. The server must have `http3=true`. `ech_config` applies
+//!   to both transports; `fingerprint` shapes only the TCP
+//!   ClientHello.
 
 use std::path::PathBuf;
 
@@ -80,6 +92,9 @@ pub struct ServerCfg {
     pub reject_non_ech: bool,
     /// `Server` header value for fake-404 responses.
     pub server_name: String,
+    /// Also serve the tunnel over HTTP/3 (QUIC) on the same `host:port`
+    /// (UDP), in addition to the TCP HTTP/1.1+WebSocket listener.
+    pub http3: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -96,8 +111,21 @@ pub struct ClientCfg {
     pub trust: ClientTrust,
     /// Browser-fingerprint profile for the TLS ClientHello.
     /// `None` = boring defaults; otherwise one of the names accepted by
-    /// [`crate::fingerprint::resolve`].
+    /// [`crate::fingerprint::resolve`]. Only applies to `Transport::Tcp`;
+    /// `quiche` builds the QUIC ClientHello itself.
     pub fingerprint: Option<String>,
+    /// Wire transport used to reach the upstream tunnel.
+    pub transport: Transport,
+}
+
+/// Wire transport the client uses to reach the server-side plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// HTTP/1.1 + WebSocket over TLS on a TCP connection (the default).
+    #[default]
+    Tcp,
+    /// HTTP/3 (WebSocket via Extended CONNECT) over QUIC on UDP.
+    H3,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +182,7 @@ impl ServerCfg {
             .get("server_name")
             .map(str::to_string)
             .unwrap_or_else(|| "nginx/1.24.0".to_string());
+        let http3 = parse_bool(o, "http3")?.unwrap_or(false);
 
         Ok(Self {
             domain,
@@ -164,6 +193,7 @@ impl ServerCfg {
             acme_cover_san,
             reject_non_ech,
             server_name,
+            http3,
         })
     }
 }
@@ -176,6 +206,7 @@ impl ClientCfg {
         let ech = build_client_ech(o)?;
         let trust = build_client_trust(o)?;
         let fingerprint = build_fingerprint(o)?;
+        let transport = build_transport(o)?;
 
         Ok(Self {
             sni,
@@ -184,7 +215,18 @@ impl ClientCfg {
             ech,
             trust,
             fingerprint,
+            transport,
         })
+    }
+}
+
+fn build_transport(o: &PluginOptions) -> Result<Transport> {
+    match o.get("transport") {
+        None | Some("") | Some("tcp") => Ok(Transport::Tcp),
+        Some("h3") | Some("http3") | Some("quic") => Ok(Transport::H3),
+        Some(other) => Err(anyhow!(
+            "plugin option `transport` must be `tcp` or `h3`, got {other:?}"
+        )),
     }
 }
 
@@ -459,6 +501,34 @@ mod tests {
     fn server_path_must_start_with_slash() {
         let err = err_str("mode=server;domain=t.x;path=ws;cert=/c;key=/k");
         assert!(err.contains("path") && err.contains('/'));
+    }
+
+    #[test]
+    fn server_http3_default_false_and_opt_in() {
+        let off = server_cfg("mode=server;domain=t.x;path=/ws;cert=/c;key=/k");
+        assert!(!off.http3);
+        let on = server_cfg("mode=server;domain=t.x;path=/ws;cert=/c;key=/k;http3=true");
+        assert!(on.http3);
+    }
+
+    #[test]
+    fn client_transport_default_tcp() {
+        let c = client_cfg("mode=client;sni=t.x;path=/ws");
+        assert_eq!(c.transport, Transport::Tcp);
+    }
+
+    #[test]
+    fn client_transport_h3_aliases() {
+        for v in ["h3", "http3", "quic"] {
+            let c = client_cfg(&format!("mode=client;sni=t.x;path=/ws;transport={v}"));
+            assert_eq!(c.transport, Transport::H3, "alias {v}");
+        }
+    }
+
+    #[test]
+    fn client_transport_unknown_errors() {
+        let err = err_str("mode=client;sni=t.x;path=/ws;transport=spdy");
+        assert!(err.contains("transport"), "got: {err}");
     }
 
     #[test]
