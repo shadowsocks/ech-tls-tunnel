@@ -85,12 +85,25 @@ impl SipEnv {
     /// configured `mode`. Server-side plugins listen on REMOTE and dial
     /// LOCAL; client-side plugins do the opposite.
     pub fn endpoints(&self, mode: Mode) -> (String, String) {
-        let remote = format!("{}:{}", self.remote_host, self.remote_port);
-        let local = format!("{}:{}", self.local_host, self.local_port);
+        let remote = join_host_port(&self.remote_host, self.remote_port);
+        let local = join_host_port(&self.local_host, self.local_port);
         match mode {
             Mode::Server => (remote, local),
             Mode::Client => (local, remote),
         }
+    }
+}
+
+/// Join host and port into `host:port`, bracketing a bare IPv6 address
+/// (`::` → `[::]:443`). shadowsocks-rust strips the brackets from a `-s
+/// "[::]:443"` bind address before exporting `SS_REMOTE_HOST` /
+/// `SS_LOCAL_HOST`, so an IPv6 address arrives bare and a naive
+/// `host:port` join yields the unparseable `:::443`.
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -276,6 +289,25 @@ mod tests {
             s.endpoints(Mode::Client),
             ("127.0.0.1:9000".to_string(), "1.2.3.4:443".to_string())
         );
+    }
+
+    #[test]
+    fn endpoints_bracket_bare_ipv6_hosts() {
+        // shadowsocks-rust exports SS_REMOTE_HOST/SS_LOCAL_HOST without
+        // brackets (`::`, `::1`) — the join must restore them.
+        let env = env_map(&[
+            ("SS_REMOTE_HOST", "::"),
+            ("SS_REMOTE_PORT", "443"),
+            ("SS_LOCAL_HOST", "::1"),
+            ("SS_LOCAL_PORT", "43485"),
+        ]);
+        let s = SipEnv::from_map(&env).unwrap();
+        let (listen, upstream) = s.endpoints(Mode::Server);
+        assert_eq!(listen, "[::]:443");
+        assert_eq!(upstream, "[::1]:43485");
+        // And both must parse as socket addresses.
+        assert!(listen.parse::<std::net::SocketAddr>().is_ok());
+        assert!(upstream.parse::<std::net::SocketAddr>().is_ok());
     }
 
     #[test]
