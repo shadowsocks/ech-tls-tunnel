@@ -18,11 +18,13 @@
 //! - `acme_email=<addr>` (auto cert via Let's Encrypt)
 //! - `acme_cache=<dir>` (default `/var/lib/ech-tls-tunnel/acme`)
 //! - `acme_staging=true|false` (default `false`)
-//! - `acme_cover_san=true|false` (default `true`) — include
+//! - `acme_cover_san=true|false` (default `false` for `cloudflare-ech.com`,
+//!   `true` otherwise) — include
 //!   `ech_public_name` as a SAN on the ACME cert. Set to `false` when
 //!   the cover name is a domain you don't own (e.g. `www.baidu.com`)
 //!   so the order only requests a cert for `domain`.
-//! - `ech_public_name=<name>` + `ech_key=<path>` (both required for ECH)
+//! - `ech_key=<path>` (enables ECH)
+//! - `ech_public_name=<name>` (default `cloudflare-ech.com`)
 //! - `reject_non_ech=true|false` (default `true`, only meaningful when
 //!   ECH is enabled) — TCP-RST any inbound TLS handshake that lacks
 //!   the ECH extension (and isn't an ACME `acme-tls/1` validator), so
@@ -54,6 +56,9 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 
 use crate::sip003::{Mode, PluginOptions};
+
+/// Default outer SNI for generated ECH keys and server configuration.
+pub const DEFAULT_ECH_PUBLIC_NAME: &str = "cloudflare-ech.com";
 
 #[derive(Debug, Clone)]
 pub enum Config {
@@ -176,7 +181,13 @@ impl ServerCfg {
         let fast_open = parse_bool(o, "fast_open")?.unwrap_or(false);
         let tls = build_server_tls(o)?;
         let ech = build_server_ech(o)?;
-        let acme_cover_san = parse_bool(o, "acme_cover_san")?.unwrap_or(true);
+        let acme_cover_san = parse_bool(o, "acme_cover_san")?.unwrap_or_else(|| {
+            !ech.as_ref().is_some_and(|ech| {
+                ech.public_name
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(DEFAULT_ECH_PUBLIC_NAME)
+            })
+        });
         let reject_non_ech = parse_bool(o, "reject_non_ech")?.unwrap_or(true);
         let server_name = o
             .get("server_name")
@@ -316,12 +327,11 @@ fn build_server_tls(o: &PluginOptions) -> Result<ServerTls> {
 fn build_server_ech(o: &PluginOptions) -> Result<Option<ServerEch>> {
     match (o.get("ech_public_name"), o.get("ech_key")) {
         (None, None) => Ok(None),
-        (Some(name), Some(key)) => Ok(Some(ServerEch {
-            public_name: name.to_string(),
+        (name, Some(key)) => Ok(Some(ServerEch {
+            public_name: name.unwrap_or(DEFAULT_ECH_PUBLIC_NAME).to_string(),
             key_file: PathBuf::from(key),
         })),
         (Some(_), None) => Err(anyhow!("`ech_public_name` requires `ech_key`")),
-        (None, Some(_)) => Err(anyhow!("`ech_key` requires `ech_public_name`")),
     }
 }
 
@@ -433,15 +443,39 @@ mod tests {
     }
 
     #[test]
-    fn server_ech_pair_required_together() {
+    fn server_ech_public_name_requires_key() {
         assert!(
             err_str("mode=server;domain=t.x;path=/ws;cert=/c;key=/k;ech_public_name=front.x")
                 .contains("ech_key")
         );
-        assert!(
-            err_str("mode=server;domain=t.x;path=/ws;cert=/c;key=/k;ech_key=/e.key")
-                .contains("ech_public_name")
+    }
+
+    #[test]
+    fn server_ech_default_name_excluded_from_acme() {
+        for name in [
+            "",
+            ";ech_public_name=cloudflare-ech.com",
+            ";ech_public_name=CLOUDFLARE-ECH.COM.",
+        ] {
+            let c = server_cfg(&format!(
+                "mode=server;domain=t.x;path=/ws;acme_email=a@b.c;ech_key=/e.key{name}"
+            ));
+            assert!(!c.acme_cover_san);
+            let ech = c.ech.expect("ech expected");
+            assert!(ech
+                .public_name
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(DEFAULT_ECH_PUBLIC_NAME));
+            assert_eq!(ech.key_file, PathBuf::from("/e.key"));
+        }
+    }
+
+    #[test]
+    fn server_ech_default_cover_san_can_be_overridden() {
+        let c = server_cfg(
+            "mode=server;domain=t.x;path=/ws;acme_email=a@b.c;ech_key=/e.key;acme_cover_san=true",
         );
+        assert!(c.acme_cover_san);
     }
 
     #[test]

@@ -28,6 +28,35 @@ ClientHelloInner.
 
 ## Install
 
+Install the plugin together with **shadowsocks-rust** in one command:
+
+```sh
+# Client: ech-tls-tunnel + sslocal
+curl -fsSL https://raw.githubusercontent.com/shadowsocks/ech-tls-tunnel/main/install.sh | sh -s -- client
+
+# Server: ech-tls-tunnel + ssserver
+curl -fsSL https://raw.githubusercontent.com/shadowsocks/ech-tls-tunnel/main/install.sh | sh -s -- server
+```
+
+The installer supports Linux x86_64/ARM64 (static musl builds) and macOS
+Apple Silicon. It requires `curl`, `tar`, `xz`, and `sha256sum` or `shasum`,
+verifies both release SHA-256 checksums, and installs into `/usr/local/bin`
+(using `sudo` when needed). It installs binaries only; follow
+[Quick start](#quick-start) to configure and run your client or server.
+Existing binaries with the same names are replaced.
+
+For a user-owned directory, append `--bin-dir "$HOME/.local/bin"`
+(create its parent first if necessary), and add that directory to `PATH`.
+To pin versions, pass environment variables to `sh`, for example:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shadowsocks/ech-tls-tunnel/main/install.sh | ECH_VERSION=v0.1.1 SS_VERSION=v1.25.0 sh -s -- client --bin-dir "$HOME/.local/bin"
+```
+
+The defaults are the latest plugin release and shadowsocks-rust `v1.25.0`.
+
+### Manual installation
+
 Pick a release binary from the
 [Releases page](https://github.com/shadowsocks/ech-tls-tunnel/releases),
 extract, and put `ech-tls-tunnel` somewhere on `PATH`:
@@ -62,7 +91,6 @@ cargo install --git https://github.com/shadowsocks/ech-tls-tunnel
 # Generate the HPKE keypair + ECHConfigList
 sudo mkdir -p /var/lib/ech-tls-tunnel
 ech-tls-tunnel ech-gen-keys \
-    --public-name front.example.com \
     --out /var/lib/ech-tls-tunnel/ech
 
 # Run ssserver with the plugin
@@ -76,7 +104,6 @@ domain=tunnel.example.com;\
 path=/ws-tunnel-CHANGE-ME;\
 acme_email=admin@example.com;\
 acme_cache=/var/lib/ech-tls-tunnel/acme;\
-ech_public_name=front.example.com;\
 ech_key=/var/lib/ech-tls-tunnel/ech/ech.key"
 ```
 
@@ -104,7 +131,7 @@ ech_config=<paste base64 ECHConfigList here>"
 ```
 
 Now `127.0.0.1:1080` is a SOCKS5 proxy whose traffic looks (to anyone
-on the wire) like an HTTPS connection to `front.example.com`.
+on the wire) like an HTTPS connection to `cloudflare-ech.com`.
 
 ## Plugin options reference
 
@@ -125,8 +152,8 @@ on the wire) like an HTTPS connection to `front.example.com`.
 | `acme_email` | — | Contact email; enables ACME (Let's Encrypt) via TLS-ALPN-01. |
 | `acme_cache` | `/var/lib/ech-tls-tunnel/acme` | Where the ACME account + cert live across restarts. |
 | `acme_staging` | `false` | Use Let's Encrypt staging — set `true` while testing to avoid rate limits. |
-| `acme_cover_san` | `true` | Include `ech_public_name` as a SAN on the ACME cert. Set `false` when the cover name is a domain you don't own (e.g. `www.baidu.com`); the cert then only covers `domain`. |
-| `ech_public_name` | — | Outer SNI advertised to public observers. Required (with `ech_key`) to enable ECH. Owning the name (with a SAN on the cert) holds up under active probing; an unowned cover name only hides the SNI from passive observers. |
+| `acme_cover_san` | `false` for `cloudflare-ech.com`; `true` otherwise | Include `ech_public_name` as a SAN on the ACME cert. Set `false` when the cover name is a domain you don't own (e.g. `www.baidu.com`); the cert then only covers `domain`. |
+| `ech_public_name` | `cloudflare-ech.com` | Outer SNI advertised to public observers. Providing `ech_key` enables ECH; the name must match the generated key. Owning the name (with a SAN on the cert) holds up under active probing; an unowned cover name only hides the SNI from passive observers. |
 | `reject_non_ech` | `true` | Only meaningful when ECH is enabled. TCP-RST any inbound TLS handshake whose ClientHello lacks the `encrypted_client_hello` extension (and isn't an ACME `acme-tls/1` validator), so active probes can't observe the production cert. |
 | `ech_key` | — | Path to the HPKE private key from `ech-gen-keys`. |
 | `server_name` | `nginx/1.24.0` | Value of the `Server` header in fake-404 responses. |
@@ -145,8 +172,14 @@ on the wire) like an HTTPS connection to `front.example.com`.
 ## CLI subcommands
 
 ```
-ech-tls-tunnel ech-gen-keys --public-name <NAME> --out <DIR>
+ech-tls-tunnel ech-gen-keys [--public-name <NAME>] --out <DIR>
 ```
+
+The public name defaults to `cloudflare-ech.com`; use `--public-name` and
+`ech_public_name` to override it. Existing keys retain their original name,
+so keep that name explicitly configured or generate and distribute new keys.
+Using this name does not route traffic through Cloudflare. ACME excludes
+this cover name by default and issues only for your tunnel domain.
 
 Generates an HPKE X25519 keypair, writes `ech.key` (binary private
 key) and `ech.config_list` (binary ECHConfigList) under `<DIR>`, and
@@ -170,7 +203,7 @@ ExecStart=/usr/local/bin/ssserver \
     -k YOUR_PASSWORD \
     -m aes-128-gcm \
     --plugin /usr/local/bin/ech-tls-tunnel \
-    --plugin-opts "mode=server;domain=tunnel.example.com;path=/ws-secret;acme_email=admin@example.com;ech_public_name=front.example.com;ech_key=/var/lib/ech-tls-tunnel/ech/ech.key"
+    --plugin-opts "mode=server;domain=tunnel.example.com;path=/ws-secret;acme_email=admin@example.com;ech_key=/var/lib/ech-tls-tunnel/ech/ech.key"
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
