@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use ech_tls_tunnel::config::Config;
+use ech_tls_tunnel::config::{Config, DEFAULT_ECH_PUBLIC_NAME};
 use ech_tls_tunnel::ech::{encode_config_list_b64, EchServerKey};
 use ech_tls_tunnel::sip003::SipEnv;
 use ech_tls_tunnel::{client, server};
@@ -26,7 +26,7 @@ enum Cmd {
     /// (ready to paste into the client's `ech_config=` plugin option).
     EchGenKeys {
         /// Outer (cleartext) SNI to advertise to public observers.
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_ECH_PUBLIC_NAME)]
         public_name: String,
         /// Output directory.
         #[arg(long, default_value = "/var/lib/ech-tls-tunnel/ech")]
@@ -99,4 +99,33 @@ fn init_tracing() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_generation_defaults_to_cloudflare_cover() {
+        let cli = Cli::try_parse_from(["ech-tls-tunnel", "ech-gen-keys"]).unwrap();
+        let Some(Cmd::EchGenKeys { public_name, .. }) = cli.command else {
+            panic!("expected key generation");
+        };
+        assert_eq!(public_name, DEFAULT_ECH_PUBLIC_NAME);
+    }
+
+    #[test]
+    fn key_generation_accepts_custom_cover() {
+        let cli = Cli::try_parse_from([
+            "ech-tls-tunnel",
+            "ech-gen-keys",
+            "--public-name",
+            "front.example.com",
+        ])
+        .unwrap();
+        let Some(Cmd::EchGenKeys { public_name, .. }) = cli.command else {
+            panic!("expected key generation");
+        };
+        assert_eq!(public_name, "front.example.com");
+    }
 }

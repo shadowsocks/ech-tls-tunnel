@@ -414,6 +414,10 @@ async fn http3_loop_round_trips_payload_with_ech() {
 /// is comfortably past the 256 limit.
 #[tokio::test]
 async fn http3_concurrent_streams_exceed_stream_limit() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     within_deadline("http3_concurrent_streams_exceed_stream_limit", async {
         let echo_addr = spawn_echo().await;
 
@@ -465,11 +469,19 @@ async fn http3_concurrent_streams_exceed_stream_limit() {
         wait_for_ready(&local_addr).await;
 
         const N: usize = 400;
+        // Establish TCP connections before sending payloads, allowing the
+        // accept loop to drain between connects. Bursting all 400 connects
+        // in one scheduler turn overflows macOS's 128-entry accept queue
+        // before those connections can exercise QUIC at all. Keep every
+        // socket open so HTTP/3 still runs out of concurrent stream credit.
+        let mut sockets = Vec::with_capacity(N);
+        for _ in 0..N {
+            sockets.push(TcpStream::connect(&local_addr).await.unwrap());
+            tokio::task::yield_now().await;
+        }
         let mut tasks = Vec::with_capacity(N);
-        for i in 0..N {
-            let addr = local_addr.clone();
+        for (i, mut sock) in sockets.into_iter().enumerate() {
             tasks.push(tokio::spawn(async move {
-                let mut sock = TcpStream::connect(&addr).await?;
                 let msg = format!("{i:04}");
                 sock.write_all(msg.as_bytes()).await?;
                 sock.flush().await?;
